@@ -266,7 +266,13 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "replace_component",
-            "Replace a component's lib_id with a new library symbol (swap the component type).",
+            "Replace a component's lib_id with a new library symbol (swap the component type). \
+             The reference is resolved through the symbol's (instances) block as well as its \
+             cached Reference property, so a reference that exists only in a sheet instantiated \
+             more than once — where one symbol is J2, J3, J4 and J7 at the same time — resolves \
+             instead of coming back 'not found'. Because those are one placement, the swap \
+             changes all of them; the returned `also_affects` lists the other references and \
+             `shared_instances` counts them. The (instances) block itself is preserved untouched.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1309,9 +1315,12 @@ async fn handle_replace_component(
     let mut content = read_consistent(&sch_path)?;
     let expected = content.clone();
 
-    // Find the symbol block for this reference
-    let (sym_start, sym_end) = match find_symbol_instance_block(&content, &reference) {
-        Some(r) => r,
+    // Find the symbol block for this reference, resolving through (instances)
+    // as well as the cached Reference property — in a sheet instantiated more
+    // than once the requested reference usually exists only there.
+    let matches = super::find_symbol_blocks_by_any_reference(&content, &reference);
+    let (sym_start, sym_end) = match matches.first() {
+        Some(&r) => r,
         None => {
             return Ok(CallToolResult::error(format!(
                 "Component '{}' not found",
@@ -1319,6 +1328,22 @@ async fn handle_replace_component(
             )))
         }
     };
+
+    // Every other reference this one symbol answers to. Replacing it changes
+    // all of them at once, which is correct — they are one placement in a
+    // shared sheet — but a caller who asked to swap "J3" is entitled to know
+    // that J2, J4 and J7 changed with it.
+    let mut also_affects: Vec<super::InstanceRef> =
+        super::symbol_instance_refs(&content, (sym_start, sym_end))
+            .into_iter()
+            .filter(|r| r.reference != reference)
+            .collect();
+    also_affects.sort_by(|a, b| {
+        a.project
+            .cmp(&b.project)
+            .then_with(|| a.reference.cmp(&b.reference))
+    });
+    also_affects.dedup_by(|a, b| a.reference == b.reference && a.project == b.project);
 
     // Find the (lib_id "OLD") and replace it — searching only within this
     // symbol's block, so a malformed instance can't reach into the next one.
@@ -1362,9 +1387,12 @@ async fn handle_replace_component(
             )));
         }
         // Re-find the block (offsets moved with the lib_id edit), then update
-        // every `(unit N)` inside it — the symbol's own and the one in its
-        // (instances …) entry.
-        if let Some((s, e)) = find_symbol_instance_block(&content, &reference) {
+        // every `(unit N)` inside it — the symbol's own and the one in each of
+        // its (instances …) entries. They all describe the same placement, so
+        // they must move together.
+        if let Some(&(s, e)) = super::find_symbol_blocks_by_any_reference(&content, &reference)
+            .first()
+        {
             let block = &content[s..e];
             let mut edits = Vec::new();
             let mut from = 0usize;
@@ -1396,7 +1424,12 @@ async fn handle_replace_component(
         "reference": reference,
         "old_lib_id": old_lib_id,
         "new_lib_id": new_lib_id,
-        "unit": new_unit
+        "unit": new_unit,
+        // Non-empty means the sheet is instantiated more than once and this
+        // swap changed every copy. Not a warning — it is what a shared sheet
+        // means — but silence here would be misleading.
+        "also_affects": also_affects,
+        "shared_instances": also_affects.len() + 1,
     })))
 }
 

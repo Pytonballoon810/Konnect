@@ -601,6 +601,139 @@ pub fn find_all_symbol_instance_blocks(content: &str, reference: &str) -> Vec<(u
     blocks
 }
 
+/// One `(path … (reference "J3"))` entry from a symbol's `(instances)` block.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct InstanceRef {
+    /// The `(project "…")` this path belongs to. Empty string is legal and
+    /// common — KiCad writes `(project "")` for paths it can no longer
+    /// attribute, and a file can carry several such blocks.
+    pub project: String,
+    /// The sheet path, `/<uuid>/<uuid>`.
+    pub path: String,
+    pub reference: String,
+}
+
+/// Every reference a placed symbol answers to, read from its `(instances)`.
+///
+/// A symbol's own `(property "Reference" …)` is a **cache of one** of these,
+/// not the truth. When a sheet is instantiated more than once — four interface
+/// sheets sharing one `Interface.kicad_sch` — the single symbol block in that
+/// file is J2, J3, J4 and J7 simultaneously, and the property happens to hold
+/// whichever one eeschema wrote last.
+pub fn symbol_instance_refs(content: &str, block: (usize, usize)) -> Vec<InstanceRef> {
+    let (start, end) = block;
+    let Some(rel) = content[start..end].find("(instances") else {
+        return Vec::new();
+    };
+    let inst_start = start + rel;
+    let bytes = content.as_bytes();
+
+    let mut out = Vec::new();
+    let mut project = String::new();
+    let mut path = String::new();
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut escaped = false;
+    let mut i = inst_start;
+
+    // Read a quoted string starting at the first `"` at or after `from`.
+    let quoted = |from: usize| -> Option<(String, usize)> {
+        let q = content[from..end].find('"')? + from + 1;
+        let e = content[q..end].find('"')? + q;
+        Some((content[q..e].to_string(), e))
+    };
+
+    while i < end {
+        let c = bytes[i] as char;
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '(' => {
+                depth += 1;
+                let rest = &content[i + 1..end.min(i + 32)];
+                let n = rest
+                    .find(|ch: char| ch.is_whitespace() || ch == '(' || ch == ')')
+                    .unwrap_or(0);
+                match &rest[..n] {
+                    "project" => {
+                        if let Some((p, _)) = quoted(i) {
+                            project = p;
+                        }
+                    }
+                    "path" => {
+                        if let Some((p, _)) = quoted(i) {
+                            path = p;
+                        }
+                    }
+                    "reference" => {
+                        if let Some((r, _)) = quoted(i) {
+                            out.push(InstanceRef {
+                                project: project.clone(),
+                                path: path.clone(),
+                                reference: r,
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    break;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Byte ranges of every placed symbol block that answers to `reference`,
+/// whether by its cached Reference property **or** by an entry in its
+/// `(instances)` block.
+///
+/// Strictly wider than [`find_all_symbol_instance_blocks`]: everything that
+/// resolved before still resolves, first and in the same order. The addition is
+/// the reference that exists only in `(instances)`, which is the common case in
+/// a sheet instantiated more than once and which previously came back "not
+/// found" — the caller reads J3 off the netlist, asks for J3, and is told no
+/// such component exists while looking straight at it.
+pub fn find_symbol_blocks_by_any_reference(content: &str, reference: &str) -> Vec<(usize, usize)> {
+    let mut blocks = find_all_symbol_instance_blocks(content, reference);
+
+    let mut from = 0usize;
+    while let Some(rel) = content[from..].find("(lib_id ") {
+        let pos = from + rel;
+        from = pos + "(lib_id ".len();
+        let Some((start, end)) = konnect_sexp::writer::find_enclosing_block(content, "symbol", pos)
+        else {
+            continue;
+        };
+        if blocks.iter().any(|&(s, _)| s == start) {
+            continue;
+        }
+        if symbol_instance_refs(content, (start, end))
+            .iter()
+            .any(|r| r.reference == reference)
+        {
+            blocks.push((start, end));
+        }
+    }
+    blocks
+}
+
 #[cfg(test)]
 mod symbol_block_tests {
     use super::*;
@@ -611,6 +744,78 @@ mod symbol_block_tests {
 
     /// Same shape, two-space indented, as this crate's writer emits.
     const KONNECT_STYLE: &str = "(kicad_sch\n  (lib_symbols\n    (symbol \"Device:R\"\n      (property \"Reference\" \"R\"\n        (at 2.032 0 90)\n      )\n    )\n  )\n  (symbol\n    (lib_id \"Device:R\")\n    (at 100 80 0)\n    (property \"Reference\" \"R1\"\n      (at 102 78 0)\n    )\n  )\n)\n";
+
+    /// One symbol in a sheet instantiated four times in one project and four
+    /// times in another, shaped like the real thing: the cached Reference says
+    /// "J2", and J3/J4/J7 exist only inside `(instances)`. Two separate
+    /// `(project "")` blocks, because KiCad really does write those.
+    const SHARED_SHEET: &str = "(kicad_sch\n\t(lib_symbols\n\t\t(symbol \"Connector_Generic:Conn_01x16\"\n\
+\t\t\t(property \"Reference\" \"J\"\n\t\t\t\t(at 0 0 0)\n\t\t\t)\n\t\t)\n\t)\n\
+\t(symbol\n\t\t(lib_id \"Connector_Generic:Conn_01x16\")\n\t\t(unit 1)\n\
+\t\t(property \"Reference\" \"J2\"\n\t\t\t(at 0 0 0)\n\t\t)\n\
+\t\t(instances\n\
+\t\t\t(project \"ModuleBase\"\n\
+\t\t\t\t(path \"/aaa/p1\"\n\t\t\t\t\t(reference \"J3\")\n\t\t\t\t\t(unit 1)\n\t\t\t\t)\n\
+\t\t\t\t(path \"/aaa/p2\"\n\t\t\t\t\t(reference \"J7\")\n\t\t\t\t\t(unit 1)\n\t\t\t\t)\n\
+\t\t\t\t(path \"/aaa/p3\"\n\t\t\t\t\t(reference \"J4\")\n\t\t\t\t\t(unit 1)\n\t\t\t\t)\n\
+\t\t\t\t(path \"/aaa/p4\"\n\t\t\t\t\t(reference \"J2\")\n\t\t\t\t\t(unit 1)\n\t\t\t\t)\n\t\t\t)\n\
+\t\t\t(project \"\"\n\
+\t\t\t\t(path \"/bbb\"\n\t\t\t\t\t(reference \"J10\")\n\t\t\t\t\t(unit 1)\n\t\t\t\t)\n\t\t\t)\n\
+\t\t\t(project \"PowerModule\"\n\
+\t\t\t\t(path \"/ccc/p1\"\n\t\t\t\t\t(reference \"J6\")\n\t\t\t\t\t(unit 1)\n\t\t\t\t)\n\t\t\t)\n\
+\t\t\t(project \"\"\n\
+\t\t\t\t(path \"/ddd/p1\"\n\t\t\t\t\t(reference \"J10\")\n\t\t\t\t\t(unit 1)\n\t\t\t\t)\n\t\t\t)\n\t\t)\n\t)\n)\n";
+
+    #[test]
+    fn instance_refs_are_read_with_their_projects() {
+        let block = find_symbol_instance_block(SHARED_SHEET, "J2").expect("J2");
+        let refs = symbol_instance_refs(SHARED_SHEET, block);
+        assert_eq!(refs.len(), 7, "one entry per path: {refs:#?}");
+        assert_eq!(refs[0].project, "ModuleBase");
+        assert_eq!(refs[0].reference, "J3");
+        assert_eq!(refs[0].path, "/aaa/p1");
+        // A second (project "") block must not be folded into the first, and
+        // must not inherit the project name that preceded it.
+        assert_eq!(refs[4].project, "");
+        assert_eq!(refs[5].project, "PowerModule");
+        assert_eq!(refs[6].project, "");
+    }
+
+    #[test]
+    fn a_reference_that_exists_only_in_instances_resolves() {
+        // The bug this closes: J3 is a real reference on a real component, and
+        // the caller reads it straight off the netlist.
+        for r in ["J3", "J7", "J4", "J6", "J10"] {
+            assert!(
+                !find_symbol_blocks_by_any_reference(SHARED_SHEET, r).is_empty(),
+                "{r} did not resolve"
+            );
+        }
+        // ...and the cached property still resolves, first and unchanged.
+        let by_prop = find_all_symbol_instance_blocks(SHARED_SHEET, "J2");
+        let by_any = find_symbol_blocks_by_any_reference(SHARED_SHEET, "J2");
+        assert_eq!(by_prop, by_any);
+        assert!(!by_any.is_empty());
+    }
+
+    #[test]
+    fn every_alias_of_one_symbol_resolves_to_the_same_block() {
+        let want = find_symbol_blocks_by_any_reference(SHARED_SHEET, "J2");
+        for r in ["J3", "J7", "J4", "J6"] {
+            assert_eq!(
+                find_symbol_blocks_by_any_reference(SHARED_SHEET, r),
+                want,
+                "{r} resolved to a different block"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reference_nobody_has_still_does_not_resolve() {
+        assert!(find_symbol_blocks_by_any_reference(SHARED_SHEET, "J99").is_empty());
+        assert!(symbol_instance_refs(EESCHEMA_STYLE, find_symbol_instance_block(EESCHEMA_STYLE, "R1").unwrap()).is_empty(),
+                "a symbol with no (instances) block yields no refs, not a panic");
+    }
 
     #[test]
     fn finds_instance_in_tab_indented_file() {
