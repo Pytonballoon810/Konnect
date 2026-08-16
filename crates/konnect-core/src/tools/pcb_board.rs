@@ -401,6 +401,30 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_import_svg_logo(args, ctx).await }
         ),
+        tool!(
+            "update_pcb_from_schematic",
+            "Reconcile a board's pad net assignments with its schematic — the programmatic \
+             equivalent of eeschema's Update PCB from Schematic (F8), without needing the GUI. \
+             Exports the netlist with kicad-cli, then rewrites every pad's net from the \
+             (reference, pad) mapping, and REMOVES a pad's net when the schematic gives it none. \
+             That removal is the point: it is what clears a stale or split net, which a merge \
+             cannot do. Footprints are never added, deleted or moved — mismatches between board \
+             and schematic are reported for a human to act on. Requires a KiCAD 10 board; a \
+             KiCAD 9 file using the numeric (net <id> \"name\") form is refused rather than \
+             half-converted. Use dry_run to see the report without writing.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string", "description": "Path to the root .kicad_sch file" },
+                    "board":     { "type": "string", "description": "Path to .kicad_pcb file" },
+                    "dry_run":   { "type": "boolean", "description": "Report what would change without writing the board", "default": false }
+                },
+                "required": ["schematic", "board"]
+            }),
+            |args, ctx| async move {
+                super::pcb_sync::handle_update_pcb_from_schematic(args, ctx).await
+            }
+        ),
     ]
 }
 

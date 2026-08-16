@@ -62,9 +62,9 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "pcb_board",
-        description: "Board outline, layers, zones, mounting holes, board text, SVG logo import",
+        description: "Board outline, layers, zones, mounting holes, board text, SVG logo import, update PCB from schematic (F8)",
         category: "pcb",
-        tool_count: 11,
+        tool_count: 12,
     },
     ToolsetMeta {
         name: "pcb_components",
