@@ -690,6 +690,77 @@ fn is_deletable_schematic_item(block: &str) -> bool {
     )
 }
 
+/// Byte ranges of the `(<tag> …)` blocks opening directly inside `range`.
+///
+/// Depth-aware and string-aware: a `Description` property routinely contains
+/// parentheses, and a naive scan would close the block early on one.
+fn nodes_at_depth_in(content: &str, range: (usize, usize), tag: &str) -> Vec<(usize, usize)> {
+    let bytes = content.as_bytes();
+    let open = format!("({tag}");
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut escaped = false;
+    let mut i = range.0;
+    while i < range.1 {
+        let c = bytes[i] as char;
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '(' => {
+                depth += 1;
+                // depth 1 is the symbol block itself; its children open at 2.
+                if depth == 2 && content[i..].starts_with(&open) {
+                    let mut d = 0usize;
+                    let mut s = false;
+                    let mut e = false;
+                    let mut j = i;
+                    while j < range.1 {
+                        let k = bytes[j] as char;
+                        if s {
+                            if e {
+                                e = false;
+                            } else if k == '\\' {
+                                e = true;
+                            } else if k == '"' {
+                                s = false;
+                            }
+                        } else {
+                            match k {
+                                '"' => s = true,
+                                '(' => d += 1,
+                                ')' => {
+                                    d -= 1;
+                                    if d == 0 {
+                                        out.push((i, j));
+                                        break;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        j += 1;
+                    }
+                }
+            }
+            ')' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        i += 1;
+    }
+    out
+}
+
 async fn handle_bulk_move(
     args: &serde_json::Value,
     _ctx: &crate::tools::ToolContext,
@@ -762,9 +833,52 @@ async fn handle_bulk_move(
                 at_end,
                 format!("{new_x} {new_y} {rot}"),
             ));
+
+            // Property (at) coordinates are absolute, so Reference/Value text
+            // has to travel with the symbol. Shifting only the placement leaves
+            // the text where it was: moving a 50-pin connector 12.70 mm down
+            // stranded its value text inside the neighbouring symbol and left
+            // its reference inside its own body. `Symbol::translate` gets this
+            // right and the singular move_schematic_component uses it; this
+            // path is a text edit and has to do the same by hand.
+            //
+            // Apply the same delta the placement actually took, not the
+            // requested one, so grid snapping cannot drift text off the symbol.
+            let (adx, ady) = (new_x - x, new_y - y);
+            let mut props = 0usize;
+            for prop in nodes_at_depth_in(&content, (sym_start, sym_end), "property") {
+                let Some(rel) = content[prop.0..prop.1].find("(at ") else {
+                    continue;
+                };
+                let pa = prop.0 + rel + "(at ".len();
+                let Some(close) = content[pa..prop.1].find(')') else {
+                    continue;
+                };
+                let pe = pa + close;
+                let f: Vec<&str> = content[pa..pe].split_whitespace().collect();
+                let (Some(px), Some(py)) = (
+                    f.first().and_then(|s| s.parse::<f64>().ok()),
+                    f.get(1).and_then(|s| s.parse::<f64>().ok()),
+                ) else {
+                    continue;
+                };
+                let tail = if f.len() > 2 {
+                    format!(" {}", f[2..].join(" "))
+                } else {
+                    String::new()
+                };
+                edits.push(SexpEdit::replace(
+                    pa,
+                    pe,
+                    format!("{} {}{}", px + adx, py + ady, tail),
+                ));
+                props += 1;
+            }
+
             placements.push(json!({
                 "old_x": x, "old_y": y,
-                "new_x": new_x, "new_y": new_y
+                "new_x": new_x, "new_y": new_y,
+                "property_fields_moved": props
             }));
         }
 
@@ -2124,5 +2238,49 @@ mod insert_order_tests {
             close > inst,
             "this test is meaningless if the last paren precedes the instances"
         );
+    }
+}
+
+#[cfg(test)]
+mod bulk_move_tests {
+    use super::*;
+
+    /// A symbol whose Reference sits below it and Value above, both at absolute
+    /// coordinates — the shape eeschema writes.
+    const SYM: &str = "(kicad_sch\n\t(symbol\n\t\t(lib_id \"Connector:Conn_02x25\")\n\
+\t\t(at 180.34 129.54 0)\n\
+\t\t(property \"Reference\" \"J6\"\n\t\t\t(at 181.61 162.56 0)\n\t\t)\n\
+\t\t(property \"Value\" \"DF12C3.0-50DS\"\n\t\t\t(at 181.61 96.52 0)\n\t\t)\n\
+\t\t(property \"Description\" \"Generic connector (double row) :-(\"\n\t\t\t(at 180.34 129.54 0)\n\t\t)\n\t)\n)";
+
+    #[test]
+    fn property_blocks_are_found_without_tripping_on_parens_in_a_description() {
+        let end = SYM.len();
+        let sym = SYM.find("(symbol").unwrap();
+        let props = nodes_at_depth_in(SYM, (sym, end), "property");
+        assert_eq!(props.len(), 3, "expected 3 properties, got {props:?}");
+        // The Description's unbalanced ":-(" must not truncate the block.
+        let last = &SYM[props[2].0..=props[2].1];
+        assert!(last.contains("Description"), "{last}");
+        assert!(last.ends_with(')'), "{last}");
+    }
+
+    #[test]
+    fn every_property_at_is_locatable_for_shifting() {
+        let end = SYM.len();
+        let sym = SYM.find("(symbol").unwrap();
+        let props = nodes_at_depth_in(SYM, (sym, end), "property");
+        let ys: Vec<f64> = props
+            .iter()
+            .filter_map(|p| {
+                let rel = SYM[p.0..p.1].find("(at ")?;
+                let a = p.0 + rel + 4;
+                let e = a + SYM[a..p.1].find(')')?;
+                SYM[a..e].split_whitespace().nth(1)?.parse().ok()
+            })
+            .collect();
+        // Reference 162.56, Value 96.52, Description 129.54 — all absolute, all
+        // needing the same delta as the placement.
+        assert_eq!(ys, vec![162.56, 96.52, 129.54]);
     }
 }

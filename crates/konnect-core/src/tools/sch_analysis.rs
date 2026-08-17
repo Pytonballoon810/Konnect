@@ -165,7 +165,12 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "check_schematic_overlaps",
-            "Find overlapping symbols or labels that may indicate placement errors.",
+            "Find overlapping symbols or labels that may indicate placement errors. Reports three \
+             kinds: 'component_overlap' (two symbol origins coincide), 'body_overlap' (two symbol \
+             extents intersect even though their origins are far apart — the case that hides a \
+             large connector drawn across another one), and 'label_overlap' (two different nets \
+             labelled at the same point). A power symbol paired with a PWR_FLAG is skipped, being \
+             coincident on purpose.",
             json!({ "type": "object",
                 "properties": {
                     "schematic": { "type": "string" },
@@ -759,6 +764,71 @@ async fn handle_get_connected_items(
     })))
 }
 
+/// Axis-aligned extent of a placed symbol, in sheet mm.
+#[derive(Debug, Clone, Copy)]
+struct Bbox {
+    min_x: f64,
+    min_y: f64,
+    max_x: f64,
+    max_y: f64,
+}
+
+impl Bbox {
+    fn grow(&mut self, x: f64, y: f64) {
+        self.min_x = self.min_x.min(x);
+        self.min_y = self.min_y.min(y);
+        self.max_x = self.max_x.max(x);
+        self.max_y = self.max_y.max(y);
+    }
+
+    /// Depth of intersection on each axis; either being <= 0 means no overlap.
+    fn intersection(&self, o: &Bbox) -> (f64, f64) {
+        (
+            self.max_x.min(o.max_x) - self.min_x.max(o.min_x),
+            self.max_y.min(o.max_y) - self.min_y.max(o.min_y),
+        )
+    }
+}
+
+/// Extent of a placed symbol, taken from its transformed pin geometry.
+///
+/// Each pin contributes both its endpoint and its root — the point `length`
+/// back along the pin, where it meets the body — so the box spans the body as
+/// well as the pin field. A KiCAD body rectangle usually reaches about one grid
+/// step past the outermost pin row, so this under-reports by ~1.27 mm a side.
+/// That is the safe direction: it can miss a graze, never invent one.
+///
+/// `None` for a symbol with no pins, which has no extent worth testing.
+fn symbol_bbox(
+    lib_syms: &[&konnect_sexp::SexpNode],
+    inst: &konnect_sexp::schematic::SymbolInstance,
+) -> Option<Bbox> {
+    use konnect_sexp::schematic::{
+        extract_lib_pins_for_unit, find_lib_symbol, pin_endpoint, pin_outward_direction,
+    };
+    let sym = find_lib_symbol(lib_syms, inst)?;
+    let t = inst.pin_transform();
+    let pins = extract_lib_pins_for_unit(sym, inst.unit);
+    if pins.is_empty() {
+        return None;
+    }
+    let mut bb = Bbox {
+        min_x: f64::MAX,
+        min_y: f64::MAX,
+        max_x: f64::MIN,
+        max_y: f64::MIN,
+    };
+    for pin in &pins {
+        let (ex, ey) = pin_endpoint(pin, t);
+        bb.grow(ex, ey);
+        // Walk back along the pin to the body. Schematic Y grows downward while
+        // the outward angle is measured counter-clockwise, hence the +sin.
+        let rad = pin_outward_direction(pin, t).to_radians();
+        bb.grow(ex - pin.length * rad.cos(), ey + pin.length * rad.sin());
+    }
+    Some(bb)
+}
+
 async fn handle_check_overlaps(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -767,19 +837,79 @@ async fn handle_check_overlaps(
     let tol = opt_f64(args, "tolerance").unwrap_or(0.5);
     let sch = cse::Schematic::load(&sch_path)?;
 
+    let (_src, tree) = konnect_sexp::schematic::read_schematic(std::path::Path::new(&sch_path))?;
+    let instances = konnect_sexp::schematic::extract_symbol_instances(&tree);
+
+    // References that are PWR_FLAGs. A PWR_FLAG is placed directly on top of a
+    // power symbol on purpose — that is how you tell ERC the net is driven — so
+    // reporting the pair as an overlap is noise that trains people to ignore
+    // the check. Two *power* symbols stacked is still a real fault and is still
+    // reported, because the skip needs one side to be the flag.
+    let flags: HashSet<&str> = instances
+        .iter()
+        .filter(|i| i.lib_id.contains("PWR_FLAG"))
+        .map(|i| i.reference.as_str())
+        .collect();
+
     // Component overlap detection using the new crate's spatial query
     let symbols: Vec<&cse::Symbol> = sch.symbols.iter().collect();
     let mut comp_overlaps: Vec<serde_json::Value> = Vec::new();
     for (i, a) in symbols.iter().enumerate() {
         let (ax, ay) = a.position();
+        let ar = a.reference().unwrap_or("?");
         for b in &symbols[i + 1..] {
             let (bx, by) = b.position();
+            let br = b.reference().unwrap_or("?");
+            if flags.contains(ar) || flags.contains(br) {
+                continue;
+            }
             if points_coincident(ax, ay, bx, by, tol) {
                 comp_overlaps.push(json!({
                     "type": "component_overlap",
-                    "a": a.reference().unwrap_or("?"),
-                    "b": b.reference().unwrap_or("?"),
+                    "a": ar, "b": br,
                     "x": ax, "y": ay
+                }));
+            }
+        }
+    }
+
+    // Body overlap — the case coincident origins cannot see.
+    //
+    // Two symbols can share most of their area while their origins sit far
+    // apart: a 40-pin and a 50-pin connector in one column overlapped by
+    // 8.89 mm with 49.5 mm between origins, so every pin, pin number and label
+    // in the shared band interleaved with the other symbol's. Nothing reported
+    // it, because the only test was whether the origins coincided.
+    let lib_syms = tree
+        .find("lib_symbols")
+        .map(|n| n.find_all("symbol"))
+        .unwrap_or_default();
+    let boxes: Vec<(&konnect_sexp::schematic::SymbolInstance, Bbox)> = instances
+        .iter()
+        .filter_map(|i| symbol_bbox(&lib_syms, i).map(|b| (i, b)))
+        .collect();
+
+    let mut body_overlaps: Vec<serde_json::Value> = Vec::new();
+    for (i, (a, ab)) in boxes.iter().enumerate() {
+        for (b, bb) in &boxes[i + 1..] {
+            // Skip the PWR_FLAG idiom, and two units of one multi-unit part,
+            // which share a reference and are meant to sit apart on the sheet
+            // but would otherwise be compared against each other.
+            if flags.contains(a.reference.as_str())
+                || flags.contains(b.reference.as_str())
+                || a.reference == b.reference
+            {
+                continue;
+            }
+            let (dx, dy) = ab.intersection(bb);
+            if dx > tol && dy > tol {
+                body_overlaps.push(json!({
+                    "type": "body_overlap",
+                    "a": a.reference, "b": b.reference,
+                    "overlap_x_mm": (dx * 100.0).round() / 100.0,
+                    "overlap_y_mm": (dy * 100.0).round() / 100.0,
+                    "a_extent": [ab.min_x, ab.min_y, ab.max_x, ab.max_y],
+                    "b_extent": [bb.min_x, bb.min_y, bb.max_x, bb.max_y],
                 }));
             }
         }
@@ -823,8 +953,58 @@ async fn handle_check_overlaps(
     }
 
     let mut all = comp_overlaps;
+    all.extend(body_overlaps);
     all.extend(label_overlaps);
     Ok(CallToolResult::json(
         &json!({ "overlap_count": all.len(), "overlaps": all }),
     ))
+}
+
+#[cfg(test)]
+mod overlap_tests {
+    use super::*;
+
+    fn bb(min_x: f64, min_y: f64, max_x: f64, max_y: f64) -> Bbox {
+        Bbox { min_x, min_y, max_x, max_y }
+    }
+
+    #[test]
+    fn bodies_that_share_area_report_the_depth_on_both_axes() {
+        // The real case: J5 spans y 55.88..106.68 and J6 y 97.79..161.29, both
+        // in the x column 179.07..184.15. Origins 49.5 mm apart, so the old
+        // origin-coincidence test saw nothing.
+        let j5 = bb(179.07, 55.88, 184.15, 106.68);
+        let j6 = bb(179.07, 97.79, 184.15, 161.29);
+        let (dx, dy) = j5.intersection(&j6);
+        assert!((dx - 5.08).abs() < 1e-9, "x depth {dx}");
+        assert!((dy - 8.89).abs() < 1e-9, "y depth {dy}");
+    }
+
+    #[test]
+    fn separated_bodies_report_a_negative_axis() {
+        // After moving J6 down 12.70 mm it starts at 110.49, clearing J5's
+        // 106.68 by 3.81 mm.
+        let j5 = bb(179.07, 55.88, 184.15, 106.68);
+        let j6 = bb(179.07, 110.49, 184.15, 173.99);
+        let (_, dy) = j5.intersection(&j6);
+        assert!(dy < 0.0, "expected a gap, got depth {dy}");
+        assert!((dy + 3.81).abs() < 1e-9, "gap should be 3.81 mm, got {}", -dy);
+    }
+
+    #[test]
+    fn touching_edges_are_not_an_overlap() {
+        let a = bb(0.0, 0.0, 10.0, 10.0);
+        let b = bb(10.0, 0.0, 20.0, 10.0);
+        let (dx, _) = a.intersection(&b);
+        assert!(dx <= 0.0, "abutting boxes must not count as overlapping");
+    }
+
+    #[test]
+    fn grow_builds_the_extent_from_points() {
+        let mut b = bb(f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+        for (x, y) in [(5.0, 1.0), (-2.0, 7.0), (3.0, -4.0)] {
+            b.grow(x, y);
+        }
+        assert_eq!((b.min_x, b.min_y, b.max_x, b.max_y), (-2.0, -4.0, 5.0, 7.0));
+    }
 }
