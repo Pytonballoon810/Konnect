@@ -13,7 +13,7 @@ use crate::tools::{
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
     commit_command,
-    geometry::snap_point,
+    geometry::{point_on_segment, points_coincident, snap_point},
     parse_sexp,
     schematic::{
         extract_lib_pins_for_unit, extract_symbol_instances, find_lib_symbol, pin_endpoint,
@@ -152,7 +152,15 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "move_connected",
-            "Move a symbol and stretch/shrink connected wire stubs to preserve connections.",
+            "Move a symbol and drag everything attached to its pins with it, so the move preserves \
+             connectivity instead of silently disconnecting the part. Wire endpoints sitting on a \
+             pin follow it (the wire stretches from its far end); net/global/hierarchical labels, \
+             no-connect flags and junctions on a pin travel with it. Attachment is exact \
+             coincidence, matching KiCAD, so nothing merely near a pin is touched. One exception \
+             is reported rather than guessed: a junction where a wire passes *through* the pin \
+             point is left in place, because it holds that T together — see junctions_left_behind \
+             in the result. Prefer this over move_schematic_component for any symbol that is \
+             already wired.",
             json!({
                 "type": "object",
                 "properties": {
@@ -889,12 +897,167 @@ async fn handle_rotate_schematic_component(
     }
 }
 
+/// Whether some wire runs *through* `(x, y)` rather than starting or ending
+/// there.
+///
+/// This is what separates a junction that may be dragged along with a moving
+/// pin from one that may not. If every wire at the point merely ends there,
+/// they all follow the pin and the dot should follow too. If one passes
+/// through, that wire is staying put and the dot is holding a T together with
+/// it — moving the dot would break the T silently.
+fn wire_passes_through(segs: &[((f64, f64), (f64, f64))], x: f64, y: f64, tol: f64) -> bool {
+    segs.iter().any(|(s, e)| {
+        point_on_segment(x, y, s.0, s.1, e.0, e.1, tol)
+            && !points_coincident(x, y, s.0, s.1, tol)
+            && !points_coincident(x, y, e.0, e.1, tol)
+    })
+}
+
+/// Move a symbol and drag everything attached to its pins along with it.
+///
+/// A plain move relocates the symbol and leaves its connections where they
+/// were, silently disconnecting it — the pins are simply somewhere else now.
+/// This finds every item sitting exactly on one of the symbol's pin endpoints
+/// and shifts it by the same delta, so wires stretch from their far end and
+/// labels, no-connects and junctions travel with the pin they belong to.
+///
+/// Deliberately not moved: anything merely *near* a pin. Attachment in KiCAD is
+/// exact coincidence, so the test is exact coincidence too.
+///
+/// A junction is the one item that can be wrong to move. Where a wire passes
+/// *through* the pin point rather than ending there, the junction belongs to
+/// that through-wire as much as to the pin, and dragging it away would break
+/// the T. Those are left in place and reported rather than guessed at.
 async fn handle_move_connected(
     args: &serde_json::Value,
-    ctx: &ToolContext,
+    _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    // For now: delegate to simple move. Wire adjustment is a Phase 2 enhancement.
-    handle_move_schematic_component(args, ctx).await
+    const TOL: f64 = 0.01;
+
+    let sch_path = get_path(args, "schematic")?;
+    let reference = match require_str(args, "reference") {
+        Ok(r) => r.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let want_x = match require_f64(args, "x") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let want_y = match require_f64(args, "y") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let (want_x, want_y) = snap_point(want_x, want_y, 1.27);
+
+    // Pin endpoints as they stand. Read from the s-expression tree because pin
+    // geometry lives in lib_symbols, which cse keeps as opaque raw nodes.
+    let (_src, tree) = read_schematic(std::path::Path::new(&sch_path))?;
+    let lib_syms = tree
+        .find("lib_symbols")
+        .map(|n| n.find_all("symbol"))
+        .unwrap_or_default();
+    let mut old_pins: Vec<(f64, f64)> = Vec::new();
+    for inst in extract_symbol_instances(&tree) {
+        if inst.reference != reference {
+            continue;
+        }
+        // Every unit of a multi-unit part, since all of them move together.
+        if let Some(sym) = find_lib_symbol(&lib_syms, &inst) {
+            let t = inst.pin_transform();
+            for p in extract_lib_pins_for_unit(sym, inst.unit) {
+                old_pins.push(pin_endpoint(&p, t));
+            }
+        }
+    }
+
+    let mut sch = cse::Schematic::load(&sch_path)?;
+
+    // The delta the placement actually took — grid snapping can make it differ
+    // from the requested one, and dragging by the requested delta would leave
+    // everything a fraction of a millimetre off its pin.
+    let (dx, dy) = match sch.symbols.by_reference_mut(&reference) {
+        Some(sym) => {
+            let (ox, oy) = sym.position();
+            sym.move_to(want_x, want_y);
+            let (nx, ny) = sym.position();
+            (nx - ox, ny - oy)
+        }
+        None => return Err(anyhow::anyhow!("Component '{}' not found", reference)),
+    };
+
+    let on_pin =
+        |x: f64, y: f64| old_pins.iter().any(|&(px, py)| points_coincident(x, y, px, py, TOL));
+
+    // Snapshot wire geometry before mutating, for the junction pass-through test.
+    let orig: Vec<((f64, f64), (f64, f64))> =
+        sch.wires.iter().map(|w| (w.start, w.end)).collect();
+
+    let mut wire_ends_moved = 0usize;
+    for w in sch.wires.iter_mut() {
+        if on_pin(w.start.0, w.start.1) {
+            w.start = (w.start.0 + dx, w.start.1 + dy);
+            wire_ends_moved += 1;
+        }
+        if on_pin(w.end.0, w.end.1) {
+            w.end = (w.end.0 + dx, w.end.1 + dy);
+            wire_ends_moved += 1;
+        }
+    }
+
+    let mut labels_moved = 0usize;
+    macro_rules! drag_labels {
+        ($coll:expr) => {
+            for l in $coll.iter_mut() {
+                if on_pin(l.at.x, l.at.y) {
+                    l.at.x += dx;
+                    l.at.y += dy;
+                    labels_moved += 1;
+                }
+            }
+        };
+    }
+    drag_labels!(sch.labels);
+    drag_labels!(sch.global_labels);
+    drag_labels!(sch.hierarchical_labels);
+
+    let mut no_connects_moved = 0usize;
+    for nc in sch.no_connects.iter_mut() {
+        if on_pin(nc.x, nc.y) {
+            nc.x += dx;
+            nc.y += dy;
+            no_connects_moved += 1;
+        }
+    }
+
+    let mut junctions_moved = 0usize;
+    let mut junctions_left: Vec<serde_json::Value> = Vec::new();
+    for j in sch.junctions.iter_mut() {
+        if !on_pin(j.x, j.y) {
+            continue;
+        }
+        if wire_passes_through(&orig, j.x, j.y, TOL) {
+            junctions_left.push(json!({ "x": j.x, "y": j.y,
+                "reason": "a wire passes through this point; the junction holds that T together" }));
+        } else {
+            j.x += dx;
+            j.y += dy;
+            junctions_moved += 1;
+        }
+    }
+
+    sch.overwrite()?;
+
+    Ok(CallToolResult::json(&json!({
+        "moved": reference,
+        "x": want_x, "y": want_y,
+        "dx": dx, "dy": dy,
+        "pins": old_pins.len(),
+        "wire_endpoints_moved": wire_ends_moved,
+        "labels_moved": labels_moved,
+        "no_connects_moved": no_connects_moved,
+        "junctions_moved": junctions_moved,
+        "junctions_left_behind": junctions_left,
+    })))
 }
 
 async fn handle_move_region(
@@ -2258,5 +2421,49 @@ mod edit_component_tests {
             reply.contains("Reference"),
             "the refusal is reported: {reply}"
         );
+    }
+}
+
+#[cfg(test)]
+mod move_connected_tests {
+    use super::*;
+
+    const TOL: f64 = 0.01;
+
+    #[test]
+    fn a_wire_ending_at_the_point_is_not_passing_through() {
+        // Two stubs meeting at the pin. Both follow the pin, so the junction
+        // between them should follow it too.
+        let segs = [((10.0, 10.0), (20.0, 10.0)), ((20.0, 10.0), (20.0, 30.0))];
+        assert!(!wire_passes_through(&segs, 20.0, 10.0, TOL));
+    }
+
+    #[test]
+    fn a_wire_crossing_the_point_is_passing_through() {
+        // A bus running past the pin, with a stub tapping it. The dot holds
+        // that T together and must not be dragged off the bus.
+        let segs = [((0.0, 10.0), (40.0, 10.0)), ((20.0, 10.0), (20.0, 30.0))];
+        assert!(wire_passes_through(&segs, 20.0, 10.0, TOL));
+    }
+
+    #[test]
+    fn a_point_off_every_wire_is_not_passing_through() {
+        let segs = [((0.0, 10.0), (40.0, 10.0))];
+        assert!(!wire_passes_through(&segs, 20.0, 25.0, TOL));
+    }
+
+    #[test]
+    fn vertical_wires_are_handled_too() {
+        let segs = [((5.0, 0.0), (5.0, 50.0))];
+        assert!(wire_passes_through(&segs, 5.0, 25.0, TOL), "midpoint");
+        assert!(!wire_passes_through(&segs, 5.0, 0.0, TOL), "endpoint");
+        assert!(!wire_passes_through(&segs, 5.0, 50.0, TOL), "endpoint");
+    }
+
+    #[test]
+    fn no_wires_at_all_means_nothing_passes_through() {
+        // The J6 case: a connector held entirely by labels, no wires anywhere
+        // near it. Every junction on such a pin is safe to carry along.
+        assert!(!wire_passes_through(&[], 175.26, 99.06, TOL));
     }
 }
