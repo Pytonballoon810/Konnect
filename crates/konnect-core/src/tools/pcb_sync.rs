@@ -535,7 +535,9 @@ mod tests {
         let nl = parse_netlist(NETLIST).unwrap();
         assert_eq!(nl.nets, vec!["GND", "/IF2_TX"]);
         assert_eq!(
-            nl.pad_nets.get(&("U1".into(), "13".into())).map(String::as_str),
+            nl.pad_nets
+                .get(&("U1".into(), "13".into()))
+                .map(String::as_str),
             Some("/IF2_TX")
         );
         assert!(nl.refs.contains("J3"));
@@ -604,7 +606,10 @@ mod tests {
         // J3 pad 15 had no (net ...) at all and must gain /IF2_TX.
         let j3 = &out[out.find("\"Reference\" \"J3\"").unwrap()..];
         let pad15 = &j3[j3.find("(pad \"15\"").unwrap()..];
-        assert!(pad15.contains("(net \"/IF2_TX\")"), "pad 15 not assigned:\n{pad15}");
+        assert!(
+            pad15.contains("(net \"/IF2_TX\")"),
+            "pad 15 not assigned:\n{pad15}"
+        );
         // In KiCad's own field order — after (layers), before (uuid) — and
         // indented to match its siblings rather than to a fixed depth.
         assert!(
@@ -620,8 +625,11 @@ mod tests {
         let nl = parse_netlist(NETLIST).unwrap();
         let before = BOARD.matches("(footprint ").count();
         let (out, report) = reconcile(BOARD, &nl).unwrap();
-        assert_eq!(out.matches("(footprint ").count(), before,
-                   "footprints must never be added or removed");
+        assert_eq!(
+            out.matches("(footprint ").count(),
+            before,
+            "footprints must never be added or removed"
+        );
         assert!(report.extra_footprints.is_empty());
         assert!(report.missing_footprints.is_empty());
     }
@@ -673,12 +681,18 @@ mod tests {
     #[test]
     #[ignore = "needs a real board; see real_board_round_trips"]
     fn real_board_drift_is_repaired_exactly() {
-        let pristine = std::fs::read_to_string(std::env::var("KONNECT_TEST_BOARD").unwrap()).unwrap();
-        let drifted = std::fs::read_to_string(std::env::var("KONNECT_TEST_DRIFTED").unwrap()).unwrap();
-        let nl =
-            parse_netlist(&std::fs::read_to_string(std::env::var("KONNECT_TEST_NETLIST").unwrap()).unwrap())
-                .unwrap();
-        assert_ne!(pristine, drifted, "the drifted copy is not actually drifted");
+        let pristine =
+            std::fs::read_to_string(std::env::var("KONNECT_TEST_BOARD").unwrap()).unwrap();
+        let drifted =
+            std::fs::read_to_string(std::env::var("KONNECT_TEST_DRIFTED").unwrap()).unwrap();
+        let nl = parse_netlist(
+            &std::fs::read_to_string(std::env::var("KONNECT_TEST_NETLIST").unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_ne!(
+            pristine, drifted,
+            "the drifted copy is not actually drifted"
+        );
 
         let (repaired, report) = reconcile(&drifted, &nl).unwrap();
         println!("{}", serde_json::to_string_pretty(&report).unwrap());
@@ -694,8 +708,12 @@ mod tests {
                 .unwrap_or(repaired.len().min(pristine.len()));
             let ctx = |s: &str| {
                 let lo = s[..at.min(s.len())].rfind('\n').map(|p| p + 1).unwrap_or(0);
-                let hi = s[lo..].char_indices().filter(|(_, c)| *c == '\n').nth(3)
-                    .map(|(p, _)| lo + p).unwrap_or(s.len());
+                let hi = s[lo..]
+                    .char_indices()
+                    .filter(|(_, c)| *c == '\n')
+                    .nth(3)
+                    .map(|(p, _)| lo + p)
+                    .unwrap_or(s.len());
                 s[lo..hi].to_string()
             };
             panic!(

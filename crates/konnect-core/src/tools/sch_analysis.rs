@@ -965,7 +965,12 @@ mod overlap_tests {
     use super::*;
 
     fn bb(min_x: f64, min_y: f64, max_x: f64, max_y: f64) -> Bbox {
-        Bbox { min_x, min_y, max_x, max_y }
+        Bbox {
+            min_x,
+            min_y,
+            max_x,
+            max_y,
+        }
     }
 
     #[test]
@@ -988,7 +993,11 @@ mod overlap_tests {
         let j6 = bb(179.07, 110.49, 184.15, 173.99);
         let (_, dy) = j5.intersection(&j6);
         assert!(dy < 0.0, "expected a gap, got depth {dy}");
-        assert!((dy + 3.81).abs() < 1e-9, "gap should be 3.81 mm, got {}", -dy);
+        assert!(
+            (dy + 3.81).abs() < 1e-9,
+            "gap should be 3.81 mm, got {}",
+            -dy
+        );
     }
 
     #[test]
