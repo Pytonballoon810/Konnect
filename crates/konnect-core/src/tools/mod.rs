@@ -338,6 +338,157 @@ pub fn ensure_root_uuid(sch: &mut konnect_schematic_editor::Schematic) -> String
     }
 }
 
+/// One `(project … (path …))` position a sheet's symbols are instantiated at.
+///
+/// A root schematic has exactly one. A sub-sheet instantiated more than once —
+/// `Interface.kicad_sch` dropped into a parent four times — has one per
+/// instantiation, per project that references the file.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct InstanceSlot {
+    /// Empty string is legal and common: KiCad writes `(project "")` for the
+    /// standalone-open case and for paths it can no longer attribute.
+    pub project: String,
+    /// `/<root-uuid>` for a root sheet, `/<root-uuid>/<sheet-uuid>` below it.
+    pub path: String,
+}
+
+/// Every `(project, path)` the sheet's existing symbols are instantiated at.
+///
+/// **This is the only reliable source.** A sub-sheet file does not record its
+/// own instantiations — the `(sheet …)` blocks that create them live in the
+/// *parent* — so the sheet's existing symbols are what carry the paths. Taking
+/// the union across all of them means one symbol missing an entry cannot narrow
+/// the set for a symbol being added beside it.
+///
+/// Returned sorted, so a placement is deterministic regardless of the order
+/// symbols happen to sit in the file.
+pub fn sheet_instance_slots(sch: &konnect_schematic_editor::Schematic) -> Vec<InstanceSlot> {
+    let mut out: Vec<InstanceSlot> = Vec::new();
+    for sym in &sch.symbols {
+        let Some(instances) = sym
+            .raw_sub_nodes
+            .iter()
+            .find(|n| n.tag() == Some("instances"))
+        else {
+            continue;
+        };
+        for project in instances.find_all("project") {
+            let name = project.value().unwrap_or("").to_owned();
+            for path in project.find_all("path") {
+                let Some(p) = path.value() else { continue };
+                let slot = InstanceSlot {
+                    project: name.clone(),
+                    path: p.to_owned(),
+                };
+                if !out.contains(&slot) {
+                    out.push(slot);
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| (&a.project, &a.path).cmp(&(&b.project, &b.path)));
+    out
+}
+
+/// Reference designators already spoken for, gathered conservatively.
+///
+/// Two sources, because either alone gives a wrong answer:
+///
+/// - **Every `.kicad_sch` beside this one**, since sibling sheets of the same
+///   project share one designator space and this file cannot see them.
+/// - **Every reference in this file, across all projects** — including stale
+///   `(project …)` sets left behind when a sheet stopped being instantiated
+///   somewhere. `Interface.kicad_sch` still carries a `PowerModule` set
+///   claiming R25–R48 after those interfaces moved to `ModuleBase`, so R28
+///   looks free against the live project and is not.
+///
+/// Over-inclusive by design: the cost of skipping a number is cosmetic, the
+/// cost of reusing one is a duplicate designator in a netlist.
+pub fn collect_used_references(sch_path: &std::path::Path) -> std::collections::HashSet<String> {
+    let mut used = std::collections::HashSet::new();
+    let Some(dir) = sch_path.parent() else {
+        return used;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return used;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.extension().and_then(|e| e.to_str()) != Some("kicad_sch") {
+            continue;
+        }
+        if let Ok(text) = std::fs::read_to_string(&p) {
+            harvest_references(&text, &mut used);
+        }
+    }
+    used
+}
+
+/// Pull designators out of raw schematic text: `(reference "R9")` from instance
+/// paths, and `(property "Reference" "R9"` from the per-symbol cache.
+///
+/// Anything not shaped like a designator is dropped, which discards the bare
+/// prefixes (`"R"`, `"C"`) that `lib_symbols` definitions carry.
+fn harvest_references(text: &str, out: &mut std::collections::HashSet<String>) {
+    for needle in ["(reference \"", "(property \"Reference\" \""] {
+        let mut from = 0usize;
+        while let Some(rel) = text[from..].find(needle) {
+            let start = from + rel + needle.len();
+            let Some(end_rel) = text[start..].find('"') else {
+                break;
+            };
+            let r = &text[start..start + end_rel];
+            if split_designator(r).is_some() {
+                out.insert(r.to_owned());
+            }
+            from = start + end_rel;
+        }
+    }
+}
+
+/// `"R28"` → `("R", 28)`. `None` for anything without a trailing number, which
+/// is how `"R"`, `"?"` and `"R?"` are rejected.
+fn split_designator(r: &str) -> Option<(&str, u32)> {
+    let digits_at = r.find(|c: char| c.is_ascii_digit())?;
+    let (prefix, digits) = r.split_at(digits_at);
+    if prefix.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some((prefix, digits.parse().ok()?))
+}
+
+/// `n` free designators sharing `seed`'s prefix, starting at the first free
+/// number at or after `seed`'s.
+///
+/// Asking for `R28` when R28 is taken yields R32 — not a collision, and not a
+/// silent reuse. Every allocation is reserved in `used` as it is made, so the
+/// returned list never collides with itself and successive calls sharing one
+/// `used` set never collide with each other — which is what lets a batch place
+/// many parts into the same sheet. `None` when `seed` carries no number to
+/// count from (`"?"`), the caller's signal to leave every instance unannotated
+/// rather than invent designators.
+pub fn allocate_references(
+    seed: &str,
+    n: usize,
+    used: &mut std::collections::HashSet<String>,
+) -> Option<Vec<String>> {
+    let (prefix, start) = split_designator(seed)?;
+    let mut out = Vec::with_capacity(n);
+    let mut next = start;
+    for _ in 0..n {
+        loop {
+            let candidate = format!("{}{}", prefix, next);
+            next += 1;
+            if !used.contains(&candidate) {
+                used.insert(candidate.clone());
+                out.push(candidate);
+                break;
+            }
+        }
+    }
+    Some(out)
+}
+
 /// Every pin placed on the sheet, paired with the transform that put it there.
 ///
 /// Unit-aware: a multi-unit library symbol superimposes every unit's pins on
@@ -813,8 +964,152 @@ mod symbol_block_tests {
     #[test]
     fn a_reference_nobody_has_still_does_not_resolve() {
         assert!(find_symbol_blocks_by_any_reference(SHARED_SHEET, "J99").is_empty());
-        assert!(symbol_instance_refs(EESCHEMA_STYLE, find_symbol_instance_block(EESCHEMA_STYLE, "R1").unwrap()).is_empty(),
-                "a symbol with no (instances) block yields no refs, not a panic");
+        assert!(
+            symbol_instance_refs(
+                EESCHEMA_STYLE,
+                find_symbol_instance_block(EESCHEMA_STYLE, "R1").unwrap()
+            )
+            .is_empty(),
+            "a symbol with no (instances) block yields no refs, not a panic"
+        );
+    }
+
+    /// Write `text` as a .kicad_sch in a fresh tempdir and load it.
+    ///
+    /// `SHARED_SHEET` deliberately isn't used here: it was written for the
+    /// text-scanning helpers and its symbol carries no `(at …)`, so it parses
+    /// to zero symbols. The slot helpers read *parsed* symbols, so they need a
+    /// fixture that survives a load.
+    fn loaded(text: &str) -> (tempfile::TempDir, konnect_schematic_editor::Schematic) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Interface.kicad_sch");
+        std::fs::write(&path, text).unwrap();
+        let sch = konnect_schematic_editor::Schematic::load(&path).unwrap();
+        assert!(!sch.symbols.is_empty(), "fixture parsed to no symbols");
+        (dir, sch)
+    }
+
+    /// Two symbols in a sheet instantiated three times under `ModuleBase` and
+    /// once under a stale `PowerModule`, plus a `(project "")` standalone
+    /// entry — and the second symbol deliberately omits one path, so the union
+    /// across symbols is what gets tested.
+    const PARSEABLE_SHARED: &str = "(kicad_sch\n\t(uuid \"root\")\n\
+\t(symbol\n\t\t(lib_id \"Device:R\")\n\t\t(at 10 10 0)\n\t\t(unit 1)\n\
+\t\t(property \"Reference\" \"R4\"\n\t\t\t(at 10 6 0)\n\t\t)\n\
+\t\t(instances\n\
+\t\t\t(project \"ModuleBase\"\n\
+\t\t\t\t(path \"/root/if1\"\n\t\t\t\t\t(reference \"R4\")\n\t\t\t\t\t(unit 1)\n\t\t\t\t)\n\
+\t\t\t\t(path \"/root/if2\"\n\t\t\t\t\t(reference \"R5\")\n\t\t\t\t\t(unit 1)\n\t\t\t\t)\n\t\t\t)\n\
+\t\t\t(project \"\"\n\
+\t\t\t\t(path \"/solo\"\n\t\t\t\t\t(reference \"R30\")\n\t\t\t\t\t(unit 1)\n\t\t\t\t)\n\t\t\t)\n\t\t)\n\t)\n\
+\t(symbol\n\t\t(lib_id \"Device:C\")\n\t\t(at 20 10 0)\n\t\t(unit 1)\n\
+\t\t(property \"Reference\" \"C1\"\n\t\t\t(at 20 6 0)\n\t\t)\n\
+\t\t(instances\n\
+\t\t\t(project \"ModuleBase\"\n\
+\t\t\t\t(path \"/root/if1\"\n\t\t\t\t\t(reference \"C1\")\n\t\t\t\t\t(unit 1)\n\t\t\t\t)\n\
+\t\t\t\t(path \"/root/if3\"\n\t\t\t\t\t(reference \"C9\")\n\t\t\t\t\t(unit 1)\n\t\t\t\t)\n\t\t\t)\n\
+\t\t\t(project \"PowerModule\"\n\
+\t\t\t\t(path \"/pm/if1\"\n\t\t\t\t\t(reference \"C40\")\n\t\t\t\t\t(unit 1)\n\t\t\t\t)\n\t\t\t)\n\t\t)\n\t)\n)\n";
+
+    #[test]
+    fn every_instantiation_of_a_shared_sheet_is_a_slot() {
+        let (_dir, sch) = loaded(PARSEABLE_SHARED);
+        let slots = sheet_instance_slots(&sch);
+        // The union across both symbols: /root/if1, if2 and if3 under
+        // ModuleBase, /solo under "", /pm/if1 under PowerModule. Deduped —
+        // if1 appears on both symbols and is one slot.
+        assert_eq!(slots.len(), 5, "{slots:#?}");
+        assert_eq!(
+            slots.iter().filter(|s| s.project == "ModuleBase").count(),
+            3,
+            "a symbol missing a path must not narrow the set for its neighbour"
+        );
+        assert!(slots
+            .iter()
+            .any(|s| s.project.is_empty() && s.path == "/solo"));
+        assert!(slots.iter().any(|s| s.project == "PowerModule"));
+        // Sorted, so placement is deterministic whatever order the file holds.
+        let mut sorted = slots.clone();
+        sorted.sort_by(|a, b| (&a.project, &a.path).cmp(&(&b.project, &b.path)));
+        assert_eq!(slots, sorted);
+    }
+
+    #[test]
+    fn a_sheet_with_no_instances_yields_no_slots() {
+        // The caller's signal to fall back to treating the sheet as its own
+        // root — a fresh file has nothing to inherit.
+        let (_dir, sch) = loaded(EESCHEMA_STYLE);
+        assert!(
+            sch.symbols
+                .iter()
+                .all(|s| !s.raw_sub_nodes.iter().any(|n| n.tag() == Some("instances"))),
+            "fixture must genuinely lack (instances), or this passes vacuously"
+        );
+        assert!(sheet_instance_slots(&sch).is_empty());
+    }
+
+    #[test]
+    fn used_references_span_every_project_in_the_file() {
+        // Scans raw text, so SHARED_SHEET serves here even though it does not
+        // parse to symbols.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Interface.kicad_sch"), SHARED_SHEET).unwrap();
+        let used = collect_used_references(&dir.path().join("Interface.kicad_sch"));
+        // Live ModuleBase set, the (project "") ones, and PowerModule's J6 —
+        // the stale set is exactly the trap: J6 looks free against the live
+        // project and is not.
+        for r in ["J2", "J3", "J4", "J7", "J10", "J6"] {
+            assert!(used.contains(r), "{r} missing from {used:?}");
+        }
+        // The lib_symbols definition's bare "J" is not a designator.
+        assert!(!used.contains("J"), "bare prefixes must not be reserved");
+    }
+
+    #[test]
+    fn used_references_include_sibling_sheets() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Interface.kicad_sch"), SHARED_SHEET).unwrap();
+        std::fs::write(dir.path().join("MCU.kicad_sch"), EESCHEMA_STYLE).unwrap();
+        let used = collect_used_references(&dir.path().join("Interface.kicad_sch"));
+        assert!(
+            used.contains("R1"),
+            "a sibling sheet shares the designator space and this file cannot see it"
+        );
+        assert!(used.contains("J3"));
+    }
+
+    #[test]
+    fn allocation_skips_what_is_taken_and_reserves_as_it_goes() {
+        let mut used: std::collections::HashSet<String> = ["R28", "R29", "R30", "R31"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // The real trap: R28 looks free against the live project, so asking for
+        // four from R28 must land past the stale set rather than collide.
+        let got = allocate_references("R28", 4, &mut used).expect("numbered seed");
+        assert_eq!(got, vec!["R32", "R33", "R34", "R35"]);
+        // Reserved, so a second call for the same sheet cannot repeat them.
+        let again = allocate_references("R28", 2, &mut used).expect("numbered seed");
+        assert_eq!(again, vec!["R36", "R37"]);
+    }
+
+    #[test]
+    fn allocation_starts_at_the_number_asked_for_when_it_is_free() {
+        let mut used = std::collections::HashSet::new();
+        assert_eq!(
+            allocate_references("R28", 3, &mut used).unwrap(),
+            vec!["R28", "R29", "R30"]
+        );
+    }
+
+    #[test]
+    fn an_unnumbered_seed_allocates_nothing() {
+        // "?" is eeschema's unannotated symbol. Inventing designators for it
+        // would annotate a part the caller deliberately left open.
+        let mut used = std::collections::HashSet::new();
+        assert!(allocate_references("?", 4, &mut used).is_none());
+        assert!(allocate_references("R?", 4, &mut used).is_none());
+        assert!(allocate_references("R", 4, &mut used).is_none());
     }
 
     #[test]

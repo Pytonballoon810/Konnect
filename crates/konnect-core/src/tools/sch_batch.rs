@@ -8,8 +8,7 @@
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{
-    find_all_symbol_instance_blocks, get_path, opt_str, project_name_for, require_f64, require_str,
-    ToolDef,
+    find_all_symbol_instance_blocks, get_path, opt_str, require_f64, require_str, ToolDef,
 };
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
@@ -458,8 +457,13 @@ async fn handle_batch_place_components(
     };
 
     let mut sch = cse::Schematic::load(&sch_path)?;
-    let root_uuid = crate::tools::ensure_root_uuid(&mut sch);
-    let project_name = project_name_for(&sch_path);
+    crate::tools::ensure_root_uuid(&mut sch);
+    // Resolved once for the sheet, not per component: every part added to a
+    // four-times-instantiated sheet lands at the same four slots. `used` is
+    // threaded through the loop so successive components cannot be handed the
+    // same designator.
+    let slots = super::sch_components::sheet_slots_for(&mut sch, &sch_path);
+    let mut used = crate::tools::collect_used_references(&sch_path);
     // Built once: the lib-table parse is memoised across the whole batch.
     let src = crate::tools::library::KiCadSymbolSource::for_file(&sch_path);
 
@@ -480,18 +484,10 @@ async fn handle_batch_place_components(
         let value = comp["value"].as_str();
         let unit = comp["unit"].as_f64().unwrap_or(1.0) as u32;
 
+        let refs = super::sch_components::refs_for_slots(reference, &slots, &mut used);
+
         match place_one_component(
-            &mut sch,
-            &root_uuid,
-            &project_name,
-            lib_id,
-            x,
-            y,
-            rotation,
-            reference,
-            value,
-            unit,
-            &src,
+            &mut sch, &slots, &refs, lib_id, x, y, rotation, value, unit, &src,
         ) {
             Ok(v) => placed.push(v),
             Err(e) => errors.push(error_text(&e)),

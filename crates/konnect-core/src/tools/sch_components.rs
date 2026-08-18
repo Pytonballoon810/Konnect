@@ -353,21 +353,23 @@ async fn handle_add_schematic_component(
     // Load via konnect-schematic-editor
     let mut sch = cse::Schematic::load(&sch_path)?;
 
-    // The instance path below must be "/<root-uuid>" — KiCAD's netlister
-    // resolves instances against the root sheet UUID and silently forms no
-    // wire-only nets for symbols whose path doesn't resolve.
-    let root_uuid = crate::tools::ensure_root_uuid(&mut sch);
-    let project_name = project_name_for(&sch_path);
+    // Instance paths must resolve against the root sheet UUID — KiCAD's
+    // netlister silently forms no wire-only nets for symbols whose path
+    // doesn't. Called unconditionally so a file predating root UUIDs is
+    // repaired even when its slots are inherited below.
+    crate::tools::ensure_root_uuid(&mut sch);
+    let slots = sheet_slots_for(&mut sch, &sch_path);
+    let mut used = crate::tools::collect_used_references(&sch_path);
+    let refs = refs_for_slots(ref_str, &slots, &mut used);
 
     let result = match place_one_component(
         &mut sch,
-        &root_uuid,
-        &project_name,
+        &slots,
+        &refs,
         &lib_id,
         x,
         y,
         rotation,
-        ref_str,
         value,
         unit,
         &crate::tools::library::KiCadSymbolSource::for_file(&sch_path),
@@ -392,23 +394,70 @@ async fn handle_add_schematic_component(
     Ok(CallToolResult::json(&result))
 }
 
+/// Where a symbol added to this sheet must be instantiated, and what it is
+/// called at each position.
+///
+/// A sheet instantiated once behaves exactly as before: one slot, and the
+/// caller's reference used verbatim. A sheet instantiated more than once gets
+/// one slot per instantiation and a distinct designator for each — writing a
+/// single path there leaves the symbol unannotated in the real project and
+/// absent from its netlist, which is the defect this exists to prevent.
+///
+/// A seed carrying no number (`"?"`, the unannotated default) allocates
+/// nothing and leaves every instance `"?"`, matching what eeschema shows for a
+/// symbol awaiting annotation.
+pub(crate) fn sheet_slots_for(
+    sch: &mut cse::Schematic,
+    sch_path: &std::path::Path,
+) -> Vec<crate::tools::InstanceSlot> {
+    let discovered = crate::tools::sheet_instance_slots(sch);
+    if !discovered.is_empty() {
+        return discovered;
+    }
+    // No symbols to inherit from: treat the sheet as its own root, which is
+    // what eeschema writes for a standalone save.
+    vec![crate::tools::InstanceSlot {
+        project: project_name_for(sch_path),
+        path: format!("/{}", crate::tools::ensure_root_uuid(sch)),
+    }]
+}
+
+/// One reference per slot. Single-slot sheets keep the caller's reference
+/// verbatim and consume nothing, so the common case is untouched; multi-slot
+/// sheets allocate from `used`, reserving as they go.
+pub(crate) fn refs_for_slots(
+    seed_reference: &str,
+    slots: &[crate::tools::InstanceSlot],
+    used: &mut std::collections::HashSet<String>,
+) -> Vec<String> {
+    if slots.len() == 1 {
+        return vec![seed_reference.to_string()];
+    }
+    crate::tools::allocate_references(seed_reference, slots.len(), used)
+        .unwrap_or_else(|| vec![seed_reference.to_string(); slots.len()])
+}
+
 /// Place one symbol into `sch`: embeds the lib_symbols definition, validates
-/// the unit, and adds the positioned instance. Does not write the file --
-/// callers own the read/write cycle (single-add and batch-add alike).
+/// the unit, and adds the positioned instance at every slot in `slots`. Does
+/// not write the file -- callers own the read/write cycle (single-add and
+/// batch-add alike).
+///
+/// `refs` is parallel to `slots`; `refs[0]` becomes the symbol's `Reference`
+/// property, which KiCAD treats as a cache of *one* of its references.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn place_one_component(
     sch: &mut cse::Schematic,
-    root_uuid: &str,
-    project_name: &str,
+    slots: &[crate::tools::InstanceSlot],
+    refs: &[String],
     lib_id: &str,
     x: f64,
     y: f64,
     rotation: f64,
-    reference: &str,
     value: Option<&str>,
     unit: u32,
     src: &dyn cse::library::SymbolLibrarySource,
 ) -> Result<serde_json::Value, CallToolResult> {
+    let reference = refs.first().map(String::as_str).unwrap_or("?");
     // Snap to 1.27mm grid
     let (x, y) = snap_point(x, y, 1.27);
     let val_str = value.unwrap_or(lib_id.split(':').next_back().unwrap_or("?"));
@@ -454,9 +503,13 @@ pub(crate) fn place_one_component(
     sym.properties
         .push(positioned("Datasheet", "", x, y, 0.0, true));
 
-    // Instance entry, keyed to the root sheet UUID like eeschema writes it:
-    // (instances (project "<name>" (path "/<root-uuid>" (reference ...) (unit 1))))
-    sym.set_instance_path(project_name, &format!("/{}", root_uuid), reference, unit);
+    // One instance entry per slot, as eeschema writes them:
+    // (instances (project "<name>" (path "<path>" (reference ...) (unit 1))))
+    // A sheet instantiated four times gets four, or the symbol resolves in
+    // none of them and never reaches the netlist.
+    for (slot, r) in slots.iter().zip(refs) {
+        sym.set_instance_path(&slot.project, &slot.path, r, unit);
+    }
 
     let uuid = sym.uuid.clone();
     sch.add_symbol(sym);
@@ -467,7 +520,17 @@ pub(crate) fn place_one_component(
         "value": val_str,
         "x": x, "y": y,
         "unit": unit,
-        "uuid": uuid
+        "uuid": uuid,
+        "shared_instances": slots.len(),
+        "references": slots
+            .iter()
+            .zip(refs)
+            .map(|(s, r)| json!({
+                "project": s.project,
+                "path": s.path,
+                "reference": r,
+            }))
+            .collect::<Vec<_>>()
     }))
 }
 
@@ -985,12 +1048,14 @@ async fn handle_move_connected(
         None => return Err(anyhow::anyhow!("Component '{}' not found", reference)),
     };
 
-    let on_pin =
-        |x: f64, y: f64| old_pins.iter().any(|&(px, py)| points_coincident(x, y, px, py, TOL));
+    let on_pin = |x: f64, y: f64| {
+        old_pins
+            .iter()
+            .any(|&(px, py)| points_coincident(x, y, px, py, TOL))
+    };
 
     // Snapshot wire geometry before mutating, for the junction pass-through test.
-    let orig: Vec<((f64, f64), (f64, f64))> =
-        sch.wires.iter().map(|w| (w.start, w.end)).collect();
+    let orig: Vec<((f64, f64), (f64, f64))> = sch.wires.iter().map(|w| (w.start, w.end)).collect();
 
     let mut wire_ends_moved = 0usize;
     for w in sch.wires.iter_mut() {
@@ -1553,8 +1618,8 @@ async fn handle_replace_component(
         // every `(unit N)` inside it — the symbol's own and the one in each of
         // its (instances …) entries. They all describe the same placement, so
         // they must move together.
-        if let Some(&(s, e)) = super::find_symbol_blocks_by_any_reference(&content, &reference)
-            .first()
+        if let Some(&(s, e)) =
+            super::find_symbol_blocks_by_any_reference(&content, &reference).first()
         {
             let block = &content[s..e];
             let mut edits = Vec::new();
@@ -1754,6 +1819,131 @@ mod tests {
             sym.has_instance_path("amp", &format!("/{}", root_uuid)),
             "instance path must be /<root-uuid> under the file-stem project name"
         );
+        // A single-instance sheet takes the caller's reference verbatim and
+        // gains no extra paths — the multi-instance work must not touch it.
+        assert_eq!(body(&result)["shared_instances"], json!(1));
+    }
+
+    /// The JSON body of a successful tool result.
+    fn body(result: &CallToolResult) -> serde_json::Value {
+        let text = match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => text.clone(),
+            _ => panic!("expected a text content block"),
+        };
+        serde_json::from_str(&text).expect("result body is JSON")
+    }
+
+    /// A sub-sheet already instantiated three times in one project and once in
+    /// another, shaped like `ModuleBase/Interface.kicad_sch`. The existing
+    /// symbol is R4/R5/R6 in ModuleBase and R25 in a stale PowerModule set.
+    fn shared_subsheet(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("Interface.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch\n\t(uuid \"a44ef46f\")\n\
+\t(symbol\n\t\t(lib_id \"Device:R\")\n\t\t(at 10 10 0)\n\t\t(unit 1)\n\
+\t\t(property \"Reference\" \"R4\"\n\t\t\t(at 10 6 0)\n\t\t)\n\
+\t\t(instances\n\
+\t\t\t(project \"ModuleBase\"\n\
+\t\t\t\t(path \"/root/if1\"\n\t\t\t\t\t(reference \"R4\")\n\t\t\t\t\t(unit 1)\n\t\t\t\t)\n\
+\t\t\t\t(path \"/root/if2\"\n\t\t\t\t\t(reference \"R5\")\n\t\t\t\t\t(unit 1)\n\t\t\t\t)\n\
+\t\t\t\t(path \"/root/if3\"\n\t\t\t\t\t(reference \"R6\")\n\t\t\t\t\t(unit 1)\n\t\t\t\t)\n\t\t\t)\n\
+\t\t\t(project \"PowerModule\"\n\
+\t\t\t\t(path \"/pm/if1\"\n\t\t\t\t\t(reference \"R25\")\n\t\t\t\t\t(unit 1)\n\t\t\t\t)\n\t\t\t)\n\t\t)\n\t)\n)\n",
+        )
+        .unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn adding_to_a_shared_sheet_writes_every_instance_path() {
+        let (dir, _env) = stub_symbol_dir();
+        let path = shared_subsheet(dir.path());
+        let ctx = test_ctx();
+
+        let result = handle_add_schematic_component(
+            &json!({
+                "schematic": path.display().to_string(),
+                "lib_id": "Device:R",
+                "x": 40.0, "y": 40.0,
+                "value": "100k",
+                "reference": "R7"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+
+        let v = body(&result);
+        assert_eq!(
+            v["shared_instances"],
+            json!(4),
+            "three ModuleBase instantiations plus the stale PowerModule one"
+        );
+
+        let sch = cse::Schematic::load(&path).unwrap();
+        let placed = sch
+            .symbols
+            .iter()
+            .find(|s| s.value_str() == Some("100k"))
+            .expect("the added resistor");
+
+        // The defect this closes: one path here left the symbol unannotated in
+        // ModuleBase and absent from its netlist.
+        for p in ["/root/if1", "/root/if2", "/root/if3"] {
+            assert!(
+                placed.has_instance_path("ModuleBase", p),
+                "missing ModuleBase path {p}"
+            );
+        }
+        assert!(placed.has_instance_path("PowerModule", "/pm/if1"));
+
+        // One designator per instantiation, none of them colliding with the
+        // R4/R5/R6/R25 already in the file.
+        let refs: Vec<&str> = v["references"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["reference"].as_str().unwrap())
+            .collect();
+        assert_eq!(refs.len(), 4);
+        for r in &refs {
+            assert!(
+                !["R4", "R5", "R6", "R25"].contains(r),
+                "{r} collides with an existing designator"
+            );
+        }
+        let unique: std::collections::HashSet<_> = refs.iter().collect();
+        assert_eq!(unique.len(), 4, "designators must be distinct: {refs:?}");
+    }
+
+    #[tokio::test]
+    async fn an_unannotated_add_to_a_shared_sheet_stays_unannotated() {
+        let (dir, _env) = stub_symbol_dir();
+        let path = shared_subsheet(dir.path());
+        let ctx = test_ctx();
+
+        let result = handle_add_schematic_component(
+            &json!({
+                "schematic": path.display().to_string(),
+                "lib_id": "Device:R",
+                "x": 40.0, "y": 40.0,
+                "value": "100k"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+
+        // Still one entry per instantiation — the paths are what the netlist
+        // needs — but no invented designators.
+        let v = body(&result);
+        assert_eq!(v["shared_instances"], json!(4));
+        for e in v["references"].as_array().unwrap() {
+            assert_eq!(e["reference"], json!("?"));
+        }
     }
 
     #[tokio::test]
