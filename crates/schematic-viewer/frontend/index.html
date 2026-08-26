@@ -288,6 +288,102 @@
       }
     }
     applySvgTheme();
+    // A new image is a new coordinate space; whatever was ringed on the old
+    // one no longer refers to anything.
+    redrawHighlights();
+  }
+
+  // ─── Agent highlights ──────────────────────────────────────────────────
+  //
+  // Rings drawn over symbols Konnect says it just touched.
+  //
+  // Coordinates are the sheet's own millimetres, which is exactly the SVG's
+  // user-unit space — kicad-cli emits viewBox="0 0 <width_mm> <height_mm>"
+  // from the same origin — so a mark's (x, y) drops straight in with no
+  // conversion.
+  //
+  // Both the resolved positions and the references they came from are kept.
+  // The positions are what gets drawn; the references are what lets them be
+  // resolved *again* after a re-render, which matters because the commonest
+  // reason a symbol is highlighted is that the agent is moving it. Redrawing
+  // the old coordinates over a new image would leave the ring behind, pointing
+  // confidently at where the part used to be.
+  let highlightMarks = [];
+  let highlightRefs = [];
+  const HIGHLIGHT_NS = 'http://www.w3.org/2000/svg';
+
+  // The design's sheets and which one is on screen. Mirrors backend state so
+  // a focus message can be resolved against this design without a round
+  // trip — and so a message naming a sheet from some *other* project can be
+  // recognised as such and ignored.
+  let currentSheets = [];
+  let currentActiveFile = null;
+
+  function clearHighlights() {
+    highlightMarks = [];
+    highlightRefs = [];
+    redrawHighlights();
+  }
+
+  function redrawHighlights() {
+    const svgEl = container.querySelector('svg');
+    if (!svgEl) return;
+
+    const existing = svgEl.querySelector('#konnect-highlights');
+    if (existing) existing.remove();
+    if (!highlightMarks.length) return;
+
+    const group = document.createElementNS(HIGHLIGHT_NS, 'g');
+    group.setAttribute('id', 'konnect-highlights');
+    // The theme filter inverts the whole image, so a colour chosen here
+    // would come out as its opposite in dark mode. Cancelling the filter on
+    // this group keeps the ring the same colour in both themes.
+    group.setAttribute('style', 'filter:none;pointer-events:none');
+
+    for (const mark of highlightMarks) {
+      const ring = document.createElementNS(HIGHLIGHT_NS, 'circle');
+      ring.setAttribute('cx', mark.x);
+      ring.setAttribute('cy', mark.y);
+      ring.setAttribute('r', '6');
+      ring.setAttribute('fill', 'none');
+      ring.setAttribute('stroke', '#ff3b30');
+      ring.setAttribute('stroke-width', '0.6');
+      ring.setAttribute('opacity', '0.9');
+
+      const pulse = document.createElementNS(HIGHLIGHT_NS, 'animate');
+      pulse.setAttribute('attributeName', 'r');
+      pulse.setAttribute('values', '6;8;6');
+      pulse.setAttribute('dur', '1.4s');
+      pulse.setAttribute('repeatCount', '3');
+      ring.appendChild(pulse);
+
+      group.appendChild(ring);
+    }
+    svgEl.appendChild(group);
+  }
+
+  async function highlightOn(file, references) {
+    if (!references || !references.length) {
+      clearHighlights();
+      return;
+    }
+    highlightRefs = references;
+    try {
+      highlightMarks = await invoke('symbol_positions', { file, references });
+    } catch (e) {
+      // Not worth interrupting the user over: the sheet is on screen and
+      // correct, only the rings are missing.
+      highlightMarks = [];
+    }
+    redrawHighlights();
+  }
+
+  // Re-resolve the current marks against the file as it now stands. Called
+  // after a re-render, so a ring tracks the symbol it names instead of the
+  // coordinates that symbol used to have.
+  async function refreshHighlightPositions() {
+    if (!highlightRefs.length || !currentActiveFile) return;
+    await highlightOn(currentActiveFile, highlightRefs);
   }
 
   // `sticky` keeps the message up until the next flash replaces it — for
@@ -409,6 +505,12 @@
   // walk (and sch_hierarchy's get_sheet_hierarchy/renumber_sheet_pages)
   // already use — not a collapsible tree, see the design note for why.
   function populateSheetSelector(sheets, activeFile) {
+    // Recorded before the single-sheet early return below, because the
+    // focus channel needs to know which files belong to this design even
+    // when there is only one and no selector is shown.
+    currentSheets = sheets || [];
+    currentActiveFile = activeFile || currentActiveFile;
+
     sheetSelector.innerHTML = '';
     if (!sheets || sheets.length <= 1) {
       sheetSelector.hidden = true;
@@ -428,11 +530,19 @@
   }
 
   async function onSheetSelected() {
-    const file = sheetSelector.value;
+    // A sheet the user picked by hand is a change of subject; rings left
+    // from the agent's last message would point at the wrong drawing.
+    clearHighlights();
+    await showSheet(sheetSelector.value);
+  }
+
+  async function showSheet(file) {
     try {
       statusEl.textContent = 'Loading sheet...';
       showLoading('Loading sheet...');
       const svg = await invoke('select_sheet', { file });
+      currentActiveFile = file;
+      if (!sheetSelector.hidden) sheetSelector.value = file;
       setSvg(svg);
       fitToPage();
       statusEl.textContent = 'Watching for changes...';
@@ -462,6 +572,11 @@
     setSvg(event.payload);
     flash('File changed — updated');
     statusEl.textContent = 'Live';
+    // setSvg has already redrawn the rings at their previous coordinates,
+    // which is right for a sheet that changed elsewhere and wrong for the
+    // usual case — the agent moving the very symbol that is ringed. Resolve
+    // them again against the file that just landed.
+    refreshHighlightPositions();
   });
 
   // Fired whenever the watcher re-walks the tree — keeps the selector in
@@ -494,6 +609,43 @@
     // big design) so the user watches a state, not a vanishing blip. The
     // sheets-updated handler below retires it when the cycle finishes.
     flash(RENDERING_MSG, false, true);
+  });
+
+  // Konnect saying which sheet it is working on, and what it touched.
+  //
+  // Path comparison is deliberately loose. The backend's sheet list holds
+  // paths as walked from the root, while Konnect names the file as its
+  // caller spelled it — the same sheet can arrive as a different string
+  // (separator, case, or a relative path against the same directory). A
+  // strict comparison silently ignores every message, which looks exactly
+  // like the channel being broken.
+  function samePath(a, b) {
+    if (!a || !b) return false;
+    const norm = (p) => p.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+    return norm(a) === norm(b);
+  }
+
+  listenOrWarn('focus-requested', async (event) => {
+    const { file, highlight, reason } = event.payload || {};
+    if (!file) return;
+
+    const known = currentSheets.find((s) => samePath(s.file, file));
+    if (!known) {
+      // Another design, or one this viewer has not loaded. Saying so beats
+      // silence: the alternative is a user watching a viewer that ignores
+      // every message with no explanation.
+      flash('Agent is working on a sheet outside this design');
+      return;
+    }
+
+    if (!samePath(currentActiveFile, known.file)) {
+      await showSheet(known.file);
+    }
+    await highlightOn(known.file, highlight || []);
+
+    const marks = (highlight || []).length;
+    const what = reason && reason !== 'focus' && reason !== 'written' ? reason : 'working here';
+    flash(marks ? `${what} — ${marks} marked` : what);
   });
 
   listenOrWarn('viewer-error', (event) => {

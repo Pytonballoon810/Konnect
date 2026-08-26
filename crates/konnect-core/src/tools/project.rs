@@ -129,6 +129,82 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_open_viewer(args, ctx).await }
         ),
+        tool!(
+            "set_live_view",
+            "Keep what is on screen in step with what you write, for the rest of the session. \
+             Off by default. With it on, writing a sheet tells the schematic viewer to show \
+             that sheet, so the user watches the design change as you work. \
+             `reload_open_boards` additionally pushes board writes into an open pcbnew — \
+             leave it off unless the user has agreed to it, because KiCAD reloads a document \
+             without asking and DISCARDS whatever they had unsaved in that board (measured: \
+             no prompt, no warning, the unsaved edit simply gone). It also costs a round-trip \
+             to KiCAD on every board write. Schematics cannot be updated this way at all: \
+             KiCAD 10 exposes no schematic API, which is what the viewer is for.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "enabled": {
+                        "type": "boolean",
+                        "description": "Turn live view on or off"
+                    },
+                    "reload_open_boards": {
+                        "type": "boolean",
+                        "description": "Also reload boards in an open pcbnew after writing them. Destroys unsaved work in that board — ask the user first. Default false.",
+                        "default": false
+                    }
+                },
+                "required": ["enabled"]
+            }),
+            |args, ctx| async move { handle_set_live_view(args, ctx).await }
+        ),
+        tool!(
+            "reload_kicad_view",
+            "Make an open pcbnew show what is now on disk for one board — the one-shot form of \
+             `set_live_view`'s board half. Use it after editing a board file that KiCAD already \
+             has open, otherwise the user sees a stale board and KiCAD's next save overwrites \
+             your edit. Reports `reloaded: false` when KiCAD does not have that board open, \
+             which is not an error. DISCARDS unsaved changes in that board without prompting; \
+             only call it when the user has agreed to that.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": {
+                        "type": "string",
+                        "description": "Path to the .kicad_pcb file to reload"
+                    }
+                },
+                "required": ["board"]
+            }),
+            |args, ctx| async move { handle_reload_kicad_view(args, ctx).await }
+        ),
+        tool!(
+            "focus_schematic_view",
+            "Point the running schematic viewer at one sheet, and optionally ring some symbols \
+             on it. Use it to show the user what you are working on before you change it — the \
+             viewer follows the file itself, but it cannot know which of twenty sheets matters \
+             right now, or which two resistors you just moved. Harmless when no viewer is \
+             running: it leaves a message the next viewer picks up.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": {
+                        "type": "string",
+                        "description": "Path to the .kicad_sch sheet to bring to the front"
+                    },
+                    "highlight": {
+                        "type": "array",
+                        "description": "References to ring on that sheet, e.g. [\"R4\", \"C12\"]",
+                        "items": { "type": "string" }
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Short note shown to the user, e.g. 'adding decoupling'"
+                    }
+                },
+                "required": ["schematic"]
+            }),
+            |args, ctx| async move { handle_focus_schematic_view(args, ctx).await }
+        ),
     ]
 }
 
@@ -402,6 +478,129 @@ async fn handle_open_viewer(
             "Schematic viewer binary (schematic-viewer.exe) not found. \
              It should be in the same directory as konnect.exe.",
         )),
+    }
+}
+
+async fn handle_set_live_view(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let enabled = match args["enabled"].as_bool() {
+        Some(enabled) => enabled,
+        None => return Ok(CallToolResult::error("'enabled' must be true or false")),
+    };
+    let reload_open_boards = args["reload_open_boards"].as_bool().unwrap_or(false);
+
+    super::live_view::configure(enabled, reload_open_boards, ctx.config.ipc_address.clone());
+
+    // Say plainly what was turned on. "Live view enabled" reads as one
+    // feature; it is two, and only one of them can lose the user's work.
+    let note = match (enabled, reload_open_boards) {
+        (false, _) => "Live view off. Writes update nothing on screen.".to_string(),
+        (true, false) => "Live view on for the schematic viewer only: writing a sheet brings \
+                          it to the front. Boards in an open pcbnew are NOT reloaded, so \
+                          pcbnew keeps showing its own copy until someone reverts it."
+            .to_string(),
+        (true, true) => "Live view on, including boards. Writing a .kicad_pcb reloads it in \
+                         an open pcbnew, DISCARDING anything unsaved there without prompting, \
+                         and costs a round-trip to KiCAD per write."
+            .to_string(),
+    };
+
+    Ok(CallToolResult::text(
+        serde_json::to_string(&json!({
+            "enabled": enabled,
+            "reload_open_boards": reload_open_boards,
+            "schematic_strategy": "viewer focus file (KiCAD 10 exposes no schematic API)",
+            "ipc_address": super::live_view::effective_ipc_address(&ctx.config.ipc_address),
+            "note": note,
+        }))
+        .unwrap(),
+    ))
+}
+
+async fn handle_reload_kicad_view(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let board = get_path(args, "board")?;
+    if !board.exists() {
+        return Ok(CallToolResult::error(format!(
+            "File not found: {}",
+            board.display()
+        )));
+    }
+
+    // Same resolution as set_live_view: this tool exists to reach an open
+    // KiCAD, so an unset address means "KiCAD's usual place", not "give up".
+    let address = super::live_view::effective_ipc_address(&ctx.config.ipc_address);
+    let board_for_task = board.clone();
+    let reloaded = tokio::task::spawn_blocking(move || {
+        konnect_ipc::client::KiCadIpcClient::new(address).reload_from_disk(&board_for_task)
+    })
+    .await?;
+
+    match reloaded {
+        Ok(true) => Ok(CallToolResult::text(
+            serde_json::to_string(&json!({
+                "reloaded": true,
+                "board": board.to_string_lossy(),
+                "note": "pcbnew now shows the file on disk. Anything unsaved in that board is gone."
+            }))
+            .unwrap(),
+        )),
+        Ok(false) => Ok(CallToolResult::text(
+            serde_json::to_string(&json!({
+                "reloaded": false,
+                "board": board.to_string_lossy(),
+                "reason": "KiCAD does not have this board open — there is no view to update."
+            }))
+            .unwrap(),
+        )),
+        Err(error) => Ok(CallToolResult::error(format!(
+            "Could not reload {} in KiCAD: {error:#}",
+            board.display()
+        ))),
+    }
+}
+
+async fn handle_focus_schematic_view(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let sheet = get_path(args, "schematic")?;
+    if !sheet.exists() {
+        return Ok(CallToolResult::error(format!(
+            "File not found: {}",
+            sheet.display()
+        )));
+    }
+
+    let highlight: Vec<String> = args["highlight"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let reason = args["reason"].as_str().unwrap_or("focus");
+
+    match super::live_view::write_focus(&sheet, &highlight, reason) {
+        Ok(seq) => Ok(CallToolResult::text(
+            serde_json::to_string(&json!({
+                "focused": sheet.to_string_lossy(),
+                "highlight": highlight,
+                "seq": seq,
+                "note": "A running viewer switches to this sheet. With none running, the \
+                         message waits for the next one."
+            }))
+            .unwrap(),
+        )),
+        Err(error) => Ok(CallToolResult::error(format!(
+            "Could not post viewer focus: {error}"
+        ))),
     }
 }
 

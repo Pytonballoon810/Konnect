@@ -235,6 +235,30 @@ pub struct KiCadIpcClient {
     client_name: String,
 }
 
+/// Where KiCad puts its API socket when nobody has said otherwise.
+///
+/// `KICAD_API_SOCKET` is set by KiCad **only when KiCad launches the plugin**.
+/// A server started by an AI client instead — how Konnect normally runs —
+/// inherits no such variable, so with no `ipc_socket_path` configured every
+/// IPC call fails as "socket path not configured" even with KiCad running and
+/// its API enabled.
+///
+/// KiCad puts the socket at `<temp>/kicad/api.sock`. Verified on Windows
+/// 2026-08-26: with KiCad 10 running, the named pipe is
+/// `\\.\pipe\C:\Users\<user>\AppData\Local\Temp\kicad\api.sock` — exactly this
+/// path, since NNG maps an `ipc://` address to a pipe of that name.
+///
+/// **This is a guess, and callers must opt into it.** `KiCadIpcClient::new`
+/// deliberately does *not* consult it: an empty address means "no KiCad" to a
+/// great deal of existing code — seven tools fall back to editing the board
+/// file on exactly that signal — and making it mean "try this address instead"
+/// would quietly redirect all of them into a live editor. Live view calls this
+/// because reaching an open KiCad is its entire purpose.
+pub fn default_socket_path() -> String {
+    let path = std::env::temp_dir().join("kicad").join("api.sock");
+    format!("ipc://{}", path.display())
+}
+
 impl KiCadIpcClient {
     /// Create a client connecting to the given IPC socket path.
     /// If empty, tries KICAD_API_SOCKET environment variable.
@@ -327,8 +351,19 @@ impl KiCadIpcClient {
         };
 
         socket.dial(&dial_url).map_err(|error| {
+            // The commonest cause by far is simply that KiCad is not running,
+            // so lead with that rather than with configuration advice the
+            // reader probably does not need. The address is named either way,
+            // because when it *is* a configuration problem the wrong address
+            // is the whole story.
             anyhow::Error::new(TransportUnreachable).context(format!(
-                "Cannot connect to KiCAD IPC at {dial_url}: {error}"
+                "Cannot reach KiCAD's IPC API at {dial_url}: {error}. \
+                 Usually this means KiCAD is not running — start it and retry. \
+                 If it is running, check Edit > Preferences > Plugins > \
+                 'Enable KiCad API', then set ipc_socket_path in the Konnect \
+                 settings to the ipc:// address listed there and restart the \
+                 AI client. \
+                 Guide: https://github.com/mixelpixx/Konnect/blob/main/docs/TROUBLESHOOTING.md"
             ))
         })?;
 
@@ -382,8 +417,23 @@ impl KiCadIpcClient {
 
     /// Get the list of open documents (boards).
     pub fn get_open_documents(&self) -> Result<Vec<kiapi::common::types::DocumentSpecifier>> {
+        self.get_open_documents_of(kiapi::common::types::DocumentType::DoctypePcb)
+    }
+
+    /// Get the list of open documents of any type.
+    ///
+    /// Split out from `get_open_documents` so a caller can ask about
+    /// schematics. Whether KiCad answers for a non-PCB type is a property of
+    /// the running KiCad, not of this call: KiCad 10's schematic API surface
+    /// is unimplemented (`schematic_commands.proto` declares a package and no
+    /// messages), so an eeschema query is expected to come back empty even
+    /// with a schematic on screen.
+    pub fn get_open_documents_of(
+        &self,
+        doctype: kiapi::common::types::DocumentType,
+    ) -> Result<Vec<kiapi::common::types::DocumentSpecifier>> {
         let cmd = kiapi::common::commands::GetOpenDocuments {
-            r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
+            r#type: doctype as i32,
         };
         let response_any = self.send_command(&cmd, "kiapi.common.commands.GetOpenDocuments")?;
         if let Some(any) = response_any {
@@ -755,6 +805,59 @@ impl KiCadIpcClient {
         };
         self.send_command(&cmd, "kiapi.common.commands.SaveDocument")?;
         Ok(())
+    }
+
+    /// Repaint an open editor frame.
+    ///
+    /// Not needed for edits made over IPC — those land in the live document
+    /// and redraw themselves. It exists for the case KiCad cannot see coming:
+    /// a document reloaded from disk underneath it, which is why
+    /// `reload_from_disk` pairs the two.
+    ///
+    /// A frame that is not open is not an error. KiCad's own note on
+    /// `RunAction` applies here too — the handler lives inside the frame, so
+    /// a closed frame simply never acts.
+    pub fn refresh_editor(&self, frame: kiapi::common::types::FrameType) -> Result<()> {
+        let cmd = kiapi::common::commands::RefreshEditor {
+            frame: frame as i32,
+        };
+        self.send_command(&cmd, "kiapi.common.commands.RefreshEditor")?;
+        Ok(())
+    }
+
+    /// Reload a document from disk, discarding KiCad's in-memory copy.
+    ///
+    /// **This destroys unsaved work in that editor**, and the API gives no way
+    /// to ask first: `GetOpenDocuments` returns identifiers with no dirty
+    /// flag. So reverting is something a caller opts into deliberately, never
+    /// a routine step tacked onto a file write.
+    pub fn revert_document(&self, document: kiapi::common::types::DocumentSpecifier) -> Result<()> {
+        let cmd = kiapi::common::commands::RevertDocument {
+            document: Some(document),
+        };
+        self.send_command(&cmd, "kiapi.common.commands.RevertDocument")?;
+        Ok(())
+    }
+
+    /// Make an open pcbnew show what is on disk at `board`, for a board this
+    /// process has just rewritten as a file.
+    ///
+    /// Returns `Ok(false)` when KiCad does not have that board open, which is
+    /// the ordinary case and not a failure — there is no view to update.
+    ///
+    /// Carries the same warning as `revert_document`: anything the user had
+    /// unsaved in that board is gone.
+    /// No `refresh_editor` call follows the revert, deliberately. KiCad 10
+    /// answers `RefreshEditor` with `AS_UNHANDLED` for every frame, so adding
+    /// it turned a reload that had already worked into a reported failure —
+    /// and it buys nothing, because reverting repaints the canvas by itself.
+    pub fn reload_from_disk(&self, board: &Path) -> Result<bool> {
+        let document = match self.find_open_board(board) {
+            Ok(document) => document,
+            Err(_) => return Ok(false),
+        };
+        self.revert_document(document)?;
+        Ok(true)
     }
 
     /// Begin a commit (undo group).

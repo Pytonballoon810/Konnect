@@ -202,6 +202,53 @@ fn kicad_lock_path(target: &Path) -> PathBuf {
     dir.join(format!("~{}.lck", name))
 }
 
+// ─── Agent focus channel ────────────────────────────────────────────────────
+
+/// Where Konnect leaves messages saying which sheet it is working on.
+///
+/// The viewer already follows the *files*, which keeps it current but not
+/// useful: on a twenty-sheet design it cannot know which sheet matters right
+/// now, and a re-render gives no clue which two symbols moved. Konnect knows
+/// both, so it says so here.
+///
+/// A fixed path under the temp directory, because the two processes never
+/// meet — Konnect spawns the viewer and then holds no handle on it, and the
+/// viewer is just as often started by hand.
+fn focus_dir() -> PathBuf {
+    std::env::temp_dir().join("konnect-viewer")
+}
+
+fn focus_path() -> PathBuf {
+    focus_dir().join("focus.json")
+}
+
+/// One message from Konnect. `seq` increments per message, so a deliberate
+/// repeat ("focus this sheet again") is distinguishable from the duplicate
+/// filesystem events a single write produces.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct FocusRequest {
+    #[serde(default)]
+    seq: u64,
+    file: String,
+    #[serde(default)]
+    highlight: Vec<String>,
+    #[serde(default)]
+    reason: String,
+}
+
+/// Where one highlighted symbol sits, in the sheet's own millimetres — which
+/// is also the SVG's coordinate system, since `kicad-cli sch export svg`
+/// emits `viewBox="0 0 <width_mm> <height_mm>"` from the same origin
+/// (verified against a rendered A2 sheet: `viewBox="0 0 594.0044 419.9890"`
+/// for `width="594.0044mm"`). That correspondence is what lets the frontend
+/// ring a symbol without any projection maths.
+#[derive(Debug, Clone, serde::Serialize)]
+struct SymbolMark {
+    reference: String,
+    x: f64,
+    y: f64,
+}
+
 // ─── SVG Rendering ──────────────────────────────────────────────────────────
 
 /// Per-process temp dir so concurrent viewer instances don't clobber each
@@ -514,6 +561,42 @@ fn select_sheet(state: tauri::State<'_, ViewerState>, file: String) -> Result<St
         .ok_or_else(|| "This sheet failed to render — see the earlier error".to_string())?;
     *state.active_file.lock().unwrap() = Some(PathBuf::from(&file));
     Ok(svg)
+}
+
+/// Where the named symbols sit on `file`, for the frontend to ring.
+///
+/// References that are not on the sheet are simply absent from the result
+/// rather than an error: Konnect names what it just touched, and by the time
+/// the viewer asks, a symbol may have been deleted or renumbered. Marking
+/// what can be found beats refusing to mark anything.
+///
+/// One known blind spot: a symbol's `Reference` property caches only *one*
+/// of its references, so on a sub-sheet instantiated several times a lookup
+/// by reference finds the symbol under whichever reference the cache holds.
+/// The symbol is the same and its position is the same — only the label used
+/// to ask for it differs.
+#[tauri::command]
+fn symbol_positions(file: String, references: Vec<String>) -> Result<Vec<SymbolMark>, String> {
+    let schematic = konnect_schematic_editor::Schematic::load(Path::new(&file))
+        .map_err(|e| format!("Could not read {file}: {e}"))?;
+
+    let wanted: HashSet<&str> = references.iter().map(String::as_str).collect();
+    Ok(schematic
+        .symbols
+        .iter()
+        .filter_map(|symbol| {
+            let reference = symbol.reference()?;
+            if !wanted.contains(reference) {
+                return None;
+            }
+            let (x, y) = symbol.position();
+            Some(SymbolMark {
+                reference: reference.to_string(),
+                x,
+                y,
+            })
+        })
+        .collect())
 }
 
 #[tauri::command]
@@ -842,6 +925,65 @@ fn spawn_render_worker(app: AppHandle, cli: String, root: PathBuf, rx: Receiver<
     });
 }
 
+// ─── Focus Watcher ──────────────────────────────────────────────────────────
+
+/// Watch the focus file and forward each new message to the frontend.
+///
+/// Kept entirely separate from the design watcher, which is rebuilt every
+/// time a design is opened and torn down with it. Focus messages must
+/// survive that — Konnect can post one before any design is loaded, and the
+/// frontend can act on it as soon as it has a tree to look the sheet up in.
+///
+/// Returns the watcher; dropping it stops watching, so the caller keeps it
+/// alive for the life of the app.
+fn spawn_focus_watcher(app: AppHandle) -> Result<notify::RecommendedWatcher, String> {
+    let dir = focus_dir();
+    // The directory must exist before it can be watched, and the viewer may
+    // well start before Konnect has ever written a message.
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
+
+    let target = focus_path();
+    // Deduplicate on seq: one write of focus.json produces several
+    // filesystem events, and re-running a focus for each of them would
+    // re-select the sheet and re-draw the rings two or three times over.
+    let last_seq = std::sync::Arc::new(AtomicU64::new(0));
+
+    let mut watcher = notify::recommended_watcher(
+        move |event: Result<notify::Event, notify::Error>| {
+            let Ok(event) = event else { return };
+            match event.kind {
+                EventKind::Modify(_) | EventKind::Create(_) => {}
+                _ => return,
+            }
+            if !event.paths.iter().any(|p| p == &target) {
+                return;
+            }
+
+            // A read can land between the writer's create and its content
+            // being flushed; an unparseable message is simply not ready yet,
+            // and the next event carries it.
+            let Ok(text) = std::fs::read_to_string(&target) else {
+                return;
+            };
+            let Ok(request) = serde_json::from_str::<FocusRequest>(&text) else {
+                return;
+            };
+            if request.seq != 0 && request.seq <= last_seq.load(Ordering::Relaxed) {
+                return;
+            }
+            last_seq.store(request.seq, Ordering::Relaxed);
+
+            let _ = app.emit("focus-requested", &request);
+        },
+    )
+    .map_err(|e| format!("Failed to create focus watcher: {}", e))?;
+
+    watcher
+        .watch(&dir, RecursiveMode::NonRecursive)
+        .map_err(|e| format!("Failed to watch {}: {}", dir.display(), e))?;
+    Ok(watcher)
+}
+
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 fn main() {
@@ -870,10 +1012,29 @@ fn main() {
 
     tauri::Builder::default()
         .manage(state)
+        .setup(|app| {
+            // Held for the life of the app: dropping the watcher stops it.
+            // A failure here is not fatal — the viewer still follows files,
+            // it just won't follow the agent — so it is reported to the
+            // window rather than aborting startup.
+            match spawn_focus_watcher(app.handle().clone()) {
+                Ok(watcher) => {
+                    app.manage(FocusWatcher(Mutex::new(Some(watcher))));
+                }
+                Err(error) => {
+                    let _ = app.handle().emit(
+                        "viewer-error",
+                        format!("Agent focus channel unavailable: {error}"),
+                    );
+                }
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             get_startup_file,
             open_schematic,
             select_sheet,
+            symbol_positions,
             refresh,
             open_in_kicad
         ])
@@ -886,6 +1047,10 @@ fn main() {
             }
         });
 }
+
+/// Keeps the focus watcher alive. Tauri's managed state is the natural owner:
+/// it lives exactly as long as the app does.
+struct FocusWatcher(#[allow(dead_code)] Mutex<Option<notify::RecommendedWatcher>>);
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
 

@@ -38,8 +38,8 @@ Six tools, grouped into *discovery/routing* and *observability*.
 
 ## Project
 
-### `project` · 6 tools
-**Purpose:** Create, open, save, snapshot KiCAD projects, and launch the live schematic viewer.
+### `project` · 9 tools
+**Purpose:** Create, open, save, snapshot KiCAD projects, launch the live schematic viewer, and keep open views in step with what is written.
 **Source:** [`crates/konnect-core/src/tools/project.rs`](crates/konnect-core/src/tools/project.rs)
 
 | Tool | Description |
@@ -50,6 +50,16 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `get_project_info` | Read project metadata from a `.kicad_pro` file. Returns name, schematic/PCB paths, last-modified times. |
 | `snapshot_project` | Export the schematic and PCB to PDF as a timestamped snapshot/checkpoint. Useful before major edits. |
 | `open_schematic_viewer` | Launch the live schematic viewer (SVG with auto-refresh on file change). Use after placing components so the user can see changes in real time. |
+| `set_live_view` | Keep what is on screen in step with what you write, for the rest of the session. Off by default. Writing a sheet brings it to the front in the viewer; `reload_open_boards` additionally reloads board writes into an open pcbnew, which **discards unsaved work there without prompting**. |
+| `reload_kicad_view` | Make an open pcbnew show what is now on disk for one board — the one-shot form of `set_live_view`'s board half. Reports `reloaded: false` when KiCAD does not have that board open. Discards unsaved changes in that board. |
+| `focus_schematic_view` | Point the running schematic viewer at one sheet and optionally ring some symbols on it, so the user sees what is being worked on. Harmless with no viewer running — the message waits for the next one. |
+
+**Why the schematic and the board are handled differently:** KiCAD 10 exposes no
+schematic API at all (`schematic_commands.proto` declares a package and no
+messages; eeschema answers `AS_UNHANDLED` even to `GetOpenDocuments`), so an
+open eeschema cannot be told anything and the viewer stands in for it. A board
+*can* be reloaded, via `RevertDocument` — `RefreshEditor` is declared in the
+API and unimplemented, and the revert repaints on its own.
 
 ---
 
@@ -182,8 +192,8 @@ Six tools, grouped into *discovery/routing* and *observability*.
 
 ## PCB
 
-### `pcb_board` · 11 tools
-**Purpose:** Board outline, layers, zones, mounting holes, board text, SVG logo import.
+### `pcb_board` · 12 tools
+**Purpose:** Board outline, layers, zones, mounting holes, board text, SVG logo import, schematic-to-board net sync.
 **Source:** [`crates/konnect-core/src/tools/pcb_board.rs`](crates/konnect-core/src/tools/pcb_board.rs)
 
 | Tool | Description |
@@ -199,6 +209,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `add_board_text` | Add a silkscreen or fabrication text string to the board. |
 | `add_zone` | Add a copper fill zone polygon on a specified layer and net. |
 | `import_svg_logo` | Import an SVG file as filled silkscreen/copper artwork (curves flattened to polygons). |
+| `update_pcb_from_schematic` | KiCAD's *Update PCB from Schematic* (F8) without the GUI. Rewrites pad nets from the schematic's netlist and **removes** a pad's net where the schematic gives none — the half a merge cannot do, and the half that clears a split net. Never adds, deletes or moves footprints; those are reported instead. Takes `dry_run`. |
 
 ### `pcb_components` · 15 tools
 **Purpose:** Place, move, rotate, align, and duplicate PCB footprints.

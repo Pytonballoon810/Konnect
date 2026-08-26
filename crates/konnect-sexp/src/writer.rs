@@ -26,6 +26,49 @@ use std::ffi::OsStr;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
+
+// ─── Write Observer ───────────────────────────────────────────────────────────
+
+/// Notified after a KiCAD document has been written and its lock released.
+pub type WriteObserver = Arc<dyn Fn(&Path) + Send + Sync>;
+
+static WRITE_OBSERVER: RwLock<Option<WriteObserver>> = RwLock::new(None);
+
+/// Install a callback run after every successful document write.
+///
+/// This exists so a higher layer can react to a write — telling an open KiCAD
+/// to reload the board, or telling the schematic viewer which sheet just
+/// changed — **without this crate knowing anything about IPC or viewers**. A
+/// callback keeps the dependency pointing the right way: `konnect-core`
+/// depends on `konnect-sexp`, never the reverse.
+///
+/// Registering here rather than at each of the sixty-odd `write_atomic` call
+/// sites is deliberate: a write path added later is covered without anyone
+/// remembering to opt it in.
+///
+/// The observer is called with the document's path, **after** the write has
+/// completed and the document lock has been dropped, so an observer is free to
+/// read the file — or hand it to another process that will. It must not panic
+/// and should be quick; a slow observer directly slows every write.
+pub fn set_write_observer(observer: Option<WriteObserver>) {
+    if let Ok(mut slot) = WRITE_OBSERVER.write() {
+        *slot = observer;
+    }
+}
+
+/// Run the installed observer, if any. Never fails a write: an observer is a
+/// notification, and a view that failed to update is not a reason to report a
+/// successful write as broken.
+pub(crate) fn notify_write(path: &Path) {
+    let observer = match WRITE_OBSERVER.read() {
+        Ok(slot) => slot.clone(),
+        Err(_) => None,
+    };
+    if let Some(observer) = observer {
+        observer(path);
+    }
+}
 
 // ─── Edit Types ───────────────────────────────────────────────────────────────
 
@@ -106,7 +149,14 @@ pub fn apply_edits(mut content: String, mut edits: Vec<SexpEdit>) -> String {
 pub fn write_atomic(path: &Path, content: &str) -> Result<(), SexpError> {
     let lock = open_document_lock(path)?;
     <std::fs::File as FileExt>::lock(&lock)?;
-    write_atomic_unlocked(path, content)
+    let written = write_atomic_unlocked(path, content);
+    // Release the document lock before notifying: an observer's whole purpose
+    // is to send someone else to read this file.
+    drop(lock);
+    if written.is_ok() {
+        notify_write(path);
+    }
+    written
 }
 
 pub(crate) fn write_atomic_unlocked(path: &Path, content: &str) -> Result<(), SexpError> {
@@ -156,6 +206,8 @@ pub fn write_atomic_if_unchanged(
             path: path.to_path_buf(),
         });
     }
+    drop(lock);
+    notify_write(path);
     Ok(())
 }
 
@@ -169,7 +221,8 @@ pub fn transact_atomic<T>(
     let current = read_string_unlocked(path)?;
     let (next, result) = update(&current)?;
 
-    if next != current {
+    let changed = next != current;
+    if changed {
         write_atomic_unlocked(path, &next)?;
         if std::fs::read_to_string(path)? != next {
             return Err(SexpError::Conflict {
@@ -178,6 +231,12 @@ pub fn transact_atomic<T>(
         }
     }
 
+    drop(lock);
+    // A transaction whose update was a no-op wrote nothing, so there is
+    // nothing for an observer to react to.
+    if changed {
+        notify_write(path);
+    }
     Ok(result)
 }
 
@@ -1268,5 +1327,137 @@ mod atomic_write_tests {
         );
         let final_content = std::fs::read_to_string(path).unwrap();
         assert!(final_content == "first" || final_content == "second");
+    }
+}
+
+#[cfg(test)]
+mod write_observer_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Every path the observer has been told about, in order.
+    ///
+    /// Recording paths rather than counting calls is not fussiness: the
+    /// observer is process-global and the rest of this crate's suite writes
+    /// documents in parallel, so a bare counter picks up their writes too and
+    /// fails in the full run while passing alone. Asserting on *this test's*
+    /// path is immune to whatever else is writing.
+    static NOTIFIED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+    /// Only one test may own the observer at a time. The path-scoping above
+    /// handles *other* tests writing concurrently; it cannot handle a sibling
+    /// test in this module replacing the observer mid-test, which silently
+    /// drops the very notifications the running test is about to assert on.
+    static OBSERVER_LOCK: Mutex<()> = Mutex::new(());
+
+    fn notifications_for(path: &Path) -> usize {
+        NOTIFIED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|seen| seen.as_path() == path)
+            .count()
+    }
+
+    /// Owns the observer for one test and removes it again on drop, so a
+    /// failing assertion cannot leave one behind for the rest of the suite.
+    struct Recording(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+    impl Recording {
+        fn install() -> Self {
+            let guard = OBSERVER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            set_write_observer(Some(std::sync::Arc::new(|path: &Path| {
+                NOTIFIED
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(path.to_path_buf());
+            })));
+            Recording(guard)
+        }
+
+        /// Same exclusion, but the caller supplies the observer.
+        fn install_custom(observer: WriteObserver) -> Self {
+            let guard = OBSERVER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            set_write_observer(Some(observer));
+            Recording(guard)
+        }
+    }
+
+    impl Drop for Recording {
+        fn drop(&mut self) {
+            set_write_observer(None);
+        }
+    }
+
+    /// The point of the hook: one registration covers every write path, so a
+    /// caller that never heard of live view still updates the view.
+    #[test]
+    fn every_write_entry_point_notifies() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("board.kicad_pcb");
+        std::fs::write(&path, "(kicad_pcb)").unwrap();
+        let _recording = Recording::install();
+
+        write_atomic(&path, "(kicad_pcb 1)").unwrap();
+        assert_eq!(notifications_for(&path), 1, "write_atomic must notify");
+
+        write_atomic_if_unchanged(&path, "(kicad_pcb 1)", "(kicad_pcb 2)").unwrap();
+        assert_eq!(
+            notifications_for(&path),
+            2,
+            "write_atomic_if_unchanged must notify"
+        );
+
+        transact_atomic(&path, |_| Ok(("(kicad_pcb 3)".to_string(), ()))).unwrap();
+        assert_eq!(notifications_for(&path), 3, "transact_atomic must notify");
+    }
+
+    /// A transaction that changes nothing writes nothing, so there is no new
+    /// state for anyone to display. Notifying anyway would make the viewer
+    /// jump to a sheet on what was effectively a read.
+    #[test]
+    fn a_no_op_transaction_does_not_notify() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sheet.kicad_sch");
+        std::fs::write(&path, "(kicad_sch)").unwrap();
+        let _recording = Recording::install();
+
+        transact_atomic(&path, |current| Ok((current.to_string(), ()))).unwrap();
+        assert_eq!(notifications_for(&path), 0);
+    }
+
+    /// The observer runs after the document lock is released, so it is free to
+    /// hand the file to something that will read it — which is the entire
+    /// reason it exists. Taking the lock again from inside proves it.
+    #[test]
+    fn the_document_is_readable_from_inside_the_observer() {
+        static READ_BACK: Mutex<Vec<(PathBuf, String)>> = Mutex::new(Vec::new());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("board.kicad_pcb");
+        std::fs::write(&path, "(old)").unwrap();
+
+        let _recording = Recording::install_custom(std::sync::Arc::new(|p: &Path| {
+            let seen = read_consistent(p).unwrap_or_default();
+            READ_BACK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((p.to_path_buf(), seen));
+        }));
+
+        write_atomic(&path, "(new)").unwrap();
+
+        let observed = READ_BACK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|(seen, _)| seen.as_path() == path)
+            .map(|(_, content)| content.clone());
+        assert_eq!(
+            observed.as_deref(),
+            Some("(new)"),
+            "an observer must see the finished document, not deadlock against \
+             the lock the write held"
+        );
     }
 }

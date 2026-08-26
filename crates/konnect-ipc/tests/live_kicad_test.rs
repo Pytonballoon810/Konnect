@@ -214,3 +214,130 @@ fn adding_a_via_actually_creates_it_on_the_board() {
         "via is missing its size/drill: {placed:?}"
     );
 }
+
+/// An open pcbnew is blind to a board rewritten underneath it, and
+/// `RevertDocument` is what makes it look again.
+///
+/// This is the whole basis of live view for boards, and every part of it was
+/// measured rather than assumed (KiCad 10, 2026-08-26):
+///
+/// - pcbnew keeps its own copy. A footprint moved on disk still reads at its
+///   old position over IPC — asserted below, because a future KiCad that
+///   started watching files would make the revert unnecessary and this test
+///   is where that would show up.
+/// - `RevertDocument` replaces that copy with the file's contents.
+/// - It does so **even with unsaved changes**, without prompting, in about
+///   700 ms. The second half of this test pins that down: it is the reason
+///   reverting is opt-in, and a KiCad that started prompting would hang a
+///   tool call on a modal instead.
+///
+/// `RefreshEditor` is deliberately absent: KiCad 10 answers `AS_UNHANDLED`
+/// for every frame, and the revert repaints the canvas on its own.
+#[test]
+#[ignore = "requires a running KiCad GUI with its IPC API enabled"]
+fn reverting_makes_pcbnew_show_the_file_on_disk() {
+    let board = std::env::var("KONNECT_LIVE_KICAD_BOARD")
+        .expect("KONNECT_LIVE_KICAD_BOARD must name the disposable open board");
+    let socket = std::env::var("KICAD_API_SOCKET").expect("KICAD_API_SOCKET is required");
+    let client = KiCadIpcClient::new(socket);
+    let path = Path::new(&board);
+
+    client.save_board().expect("initial board save failed");
+    let reference = client
+        .list_footprints()
+        .expect("list_footprints")
+        .into_iter()
+        .find(|f| !f.reference.is_empty())
+        .map(|f| f.reference)
+        .expect("board has no referenced footprint");
+
+    let before = client
+        .get_footprint(&reference)
+        .expect("get_footprint")
+        .expect("footprint vanished");
+
+    // Rewrite the file the way an external tool does — KiCad is not told.
+    let source = std::fs::read_to_string(path).expect("read board");
+    let shifted = shift_footprint_y(&source, &reference, 5.0)
+        .unwrap_or_else(|| panic!("could not shift {reference} in the board file"));
+    std::fs::write(path, &shifted).expect("write board");
+
+    let unaware = client
+        .get_footprint(&reference)
+        .expect("get_footprint")
+        .expect("footprint vanished");
+    assert_eq!(
+        unaware.position.y, before.position.y,
+        "pcbnew reported the on-disk position without being told to reload — \
+         if KiCad has started following the file, live view's revert is no \
+         longer needed and its unsaved-work hazard can go with it"
+    );
+
+    assert!(
+        client.reload_from_disk(path).expect("reload_from_disk"),
+        "the board under test must be the one KiCad has open"
+    );
+
+    let reloaded = client
+        .get_footprint(&reference)
+        .expect("get_footprint")
+        .expect("footprint vanished");
+    assert!(
+        (reloaded.position.y - (before.position.y + 5.0)).abs() < 1e-6,
+        "after reverting, pcbnew should show the file's {} — it shows {}",
+        before.position.y + 5.0,
+        reloaded.position.y
+    );
+
+    // An unsaved change is discarded silently. Timed, because a KiCad that
+    // began asking would block the call on a dialog rather than fail it.
+    client
+        .move_footprint(&reference, reloaded.position.x, reloaded.position.y + 12.0)
+        .expect("move_footprint");
+    let started = std::time::Instant::now();
+    let document = client.find_open_board(path).expect("find_open_board");
+    client.revert_document(document).expect("revert");
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "reverting a modified document took {elapsed:?} — KiCad may now be \
+         prompting, which would hang a tool call"
+    );
+    let after = client
+        .get_footprint(&reference)
+        .expect("get_footprint")
+        .expect("footprint vanished");
+    assert!(
+        (after.position.y - reloaded.position.y).abs() < 1e-6,
+        "the unsaved move survived a revert — if KiCad has started protecting \
+         unsaved work, set_live_view's warning is now wrong"
+    );
+}
+
+/// Shift the `(at x y [angle])` of the footprint carrying `reference` by `dy`
+/// millimetres, editing the s-expression text the way an external tool would.
+fn shift_footprint_y(text: &str, reference: &str, dy: f64) -> Option<String> {
+    let anchor = text.find(&format!("\"Reference\" \"{reference}\""))?;
+    // A footprint's own (at ...) precedes its properties.
+    let start = text[..anchor].rfind("(footprint ")?;
+    let at = text[start..anchor].find("(at ")? + start;
+    let end = text[at..].find(')')? + at;
+    let mut parts = text[at + 4..end].split_whitespace();
+    let x: f64 = parts.next()?.parse().ok()?;
+    let y: f64 = parts.next()?.parse().ok()?;
+    let rest: Vec<&str> = parts.collect();
+    let tail = if rest.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", rest.join(" "))
+    };
+    Some(format!(
+        "{}(at {} {}{}{}",
+        &text[..at],
+        x,
+        y + dy,
+        tail,
+        &text[end..]
+    ))
+}

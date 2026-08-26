@@ -960,6 +960,9 @@ async fn handle_rotate_schematic_component(
     }
 }
 
+/// One wire as its two endpoints, in schematic millimetres.
+type WireSegment = ((f64, f64), (f64, f64));
+
 /// Whether some wire runs *through* `(x, y)` rather than starting or ending
 /// there.
 ///
@@ -968,7 +971,7 @@ async fn handle_rotate_schematic_component(
 /// they all follow the pin and the dot should follow too. If one passes
 /// through, that wire is staying put and the dot is holding a T together with
 /// it — moving the dot would break the T silently.
-fn wire_passes_through(segs: &[((f64, f64), (f64, f64))], x: f64, y: f64, tol: f64) -> bool {
+fn wire_passes_through(segs: &[WireSegment], x: f64, y: f64, tol: f64) -> bool {
     segs.iter().any(|(s, e)| {
         point_on_segment(x, y, s.0, s.1, e.0, e.1, tol)
             && !points_coincident(x, y, s.0, s.1, tol)
@@ -1055,7 +1058,7 @@ async fn handle_move_connected(
     };
 
     // Snapshot wire geometry before mutating, for the junction pass-through test.
-    let orig: Vec<((f64, f64), (f64, f64))> = sch.wires.iter().map(|w| (w.start, w.end)).collect();
+    let orig: Vec<WireSegment> = sch.wires.iter().map(|w| (w.start, w.end)).collect();
 
     let mut wire_ends_moved = 0usize;
     for w in sch.wires.iter_mut() {

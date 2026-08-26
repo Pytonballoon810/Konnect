@@ -324,8 +324,7 @@ fn net_insert_point(content: &str, pad: Span) -> (usize, String) {
     let kids = children_of(content, pad);
     let anchor = kids
         .iter()
-        .filter(|(tag, _)| PAD_CHILDREN_BEFORE_NET.contains(tag))
-        .next_back();
+        .rfind(|(tag, _)| PAD_CHILDREN_BEFORE_NET.contains(tag));
 
     match anchor {
         Some((_, span)) => (span.end + 1, indent_at(content, span.start).to_string()),

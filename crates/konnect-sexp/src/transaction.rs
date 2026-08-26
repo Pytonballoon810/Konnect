@@ -298,6 +298,20 @@ pub fn commit_file_transaction(
     verify_after_images(&root, &journal_path, &journal.entries)?;
     remove_journal(&journal_path)?;
 
+    // Every file in the transaction landed. Drop the locks before notifying,
+    // then announce each document: a multi-file transaction is several
+    // documents changing at once, and an observer told about only the first
+    // would leave the rest of the view stale.
+    let written: Vec<PathBuf> = journal
+        .entries
+        .iter()
+        .map(|entry| root.join(&entry.path))
+        .collect();
+    drop(_locks);
+    for path in &written {
+        crate::writer::notify_write(path);
+    }
+
     Ok(TransactionCommit {
         id,
         files: journal.entries.len(),
